@@ -1,34 +1,29 @@
-# Portfolio Agent (Trade Republic – Analyse & Alerts)
+# Portfolio Agent (Trade Republic – Analyse, Alerts & Chancenfinder)
 
-## Schnellstart lokal
+## Start (lokal)
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env  # Variablen eintragen
-python monitor.py     # startet Scheduler (Daily + Intraday)
+cp .env.example .env  # Variablen befüllen
+python monitor.py
 
-## Render (empfohlen)
-1) Repo auf GitHub pushen.
-2) Render → New → Web Service (oder Background Worker).
-3) Build Command: `pip install -r requirements.txt`
-4) Start Command: `python monitor.py`
-5) Environment: `.env`-Variablen im Dashboard hinterlegen.
-6) Service dauerhaft laufen lassen (Background Worker).
+## Render (24/7 empfohlen)
+- New → Background Worker
+- Build Command: pip install -r requirements.txt
+- Start Command: python monitor.py
+- Environment: .env-Variablen im Dashboard hinterlegen
 
-## Replit
-- Neues Repl (Python), Dateien einfügen.
-- Secrets aus `.env.example` als Replit Secrets anlegen.
-- `pip install -r requirements.txt`
-- Run: `python monitor.py`
+## Dateien
+- monitor.py        → Agent mit Tagesreport, Intraday-Alerts & Chancenfinder
+- positions.json    → Dein Depot (editierbar; optional SL/TP pro Position)
+- watchlist.json    → Wird beim Start automatisch aus Depot + Universen gepflegt
+- .env              → Telegram/E-Mail & Scan-Parameter (MAX_STOCKS/MAX_CRYPTO)
+- requirements.txt  → Python-Abhängigkeiten
 
-## Regeln (Stop/Take)
-In `positions.json` optional pro Position:
-- `stop_loss_pct`: Trailing-SL relativ zum beobachteten High
-- `take_profit_pct`: Take-Profit relativ zum beobachteten Low
-
-## Benachrichtigungen
-- Telegram via Bot-Token & Chat-ID
-- E-Mail via SMTP (optional)
+## Zeiten
+- 06:30  Tagesbericht
+- 06:10–22:00 Intraday-Überwachung alle 15 Minuten (Mo–Fr)
+- 07:15 / 12:15 / 16:15 / 20:15  Chancenfinder (täglich)
 
 ## Hinweise
-- Das Skript führt **keine Trades** aus. Es analysiert, alarmiert und erstellt Reports.
-- Handelsentscheidungen triffst du selbst in Trade Republic.
+- Kein Auto-Trading. Der Agent analysiert & sendet Signale.
+- Mindestdepot 1.500 € wird respektiert (Positionsgrößen berücksichtigen Puffer).
