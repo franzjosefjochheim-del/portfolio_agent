@@ -12,11 +12,28 @@ import pandas as pd
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+# ----------------------------- Konfiguration -----------------------------
+
 TZ = ZoneInfo("Europe/Berlin")
 STATE_FILE = "last_state.json"
 WATCHLIST_FILE = "watchlist.json"
 
-# ============================ Utils ============================
+# Basis-Universum: Indizes, Sektoren, Qualitätswerte, sowie deine gehandelten Plätze
+BASE_UNIVERSE_STOCKS = [
+    # Indizes / breite ETFs
+    "SPY","QQQ","IWM","XLF","XLE","SOXX","XLK","XLV",
+    # Mega Caps / Qualität
+    "AAPL","MSFT","NVDA","AMD","ASML.AS","KO","OXY",
+    # Deine ETFs & relevanten Handelsplätze
+    "VUSD.L","VUAA.L","SWDA.L","LQQ.PA","CHIP.PA","HYQ.DE","BRN.AX","DAPP.AS","FVRR",
+]
+BASE_UNIVERSE_CRYPTO = ["bitcoin","ethereum","solana","ripple","cardano","chainlink"]
+
+# Aggressiver Zusatz-Korb (automatisch aktivierbar via EXPAND_UNIVERSE=true)
+EXTRA_UNIVERSE_STOCKS = ["TSLA","META","AMZN","GOOGL","NFLX","MU","AVGO","SMH","CORN","URA"]
+EXTRA_UNIVERSE_CRYPTO = ["avalanche-2","polkadot","uniswap","litecoin","optimism","arbitrum"]
+
+# ----------------------------- Utils ------------------------------------
 
 def now_str():
     return datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
@@ -45,7 +62,7 @@ def _dedup_keep_order(seq):
             out.append(k)
     return out
 
-# ============================ Datenquellen ============================
+# ----------------------------- Datenquellen -----------------------------
 
 def yf_price(ticker: str) -> float:
     try:
@@ -97,7 +114,7 @@ def coingecko_history(coin_id: str, days=180) -> pd.Series:
         print(f"[{now_str()}] WARN cg history {coin_id}: {e}")
         return pd.Series(dtype=float)
 
-# ============================ Notifications ============================
+# ----------------------------- Benachrichtigungen ----------------------
 
 def send_telegram(msg: str):
     token = os.getenv("TG_BOT_TOKEN")
@@ -138,7 +155,7 @@ def notify(title: str, text: str):
     send_telegram(header)
     send_email(title, header)
 
-# ============================ Portfolio-Core ============================
+# ----------------------------- Portfolio-Core -------------------------
 
 def load_positions() -> dict:
     p = load_json("positions.json", {})
@@ -197,13 +214,13 @@ def render_report(items, total):
         px = it["price"]
         pxs = "n/a" if not (px == px) else f"{px:,.2f} €"
         val = it["value"]
-        vals = "n/a" if not (val == val) else f"{val:, .2f} €".replace(", ", ",")
+        vals = "n/a" if not (val == val) else f"{val:,.2f} €"
         lines.append(f"{it['name']:<35} ({it['code']})  {it['qty']:.6f} × {pxs} = {vals}")
     lines.append("---------------------------------------------")
     lines.append(f"💰 Gesamtwert: {total:,.2f} €")
     return "\n".join(lines)
 
-# ============================ Risk/Alert ============================
+# ----------------------------- Risk/Alerts ----------------------------
 
 def pct_change(new, old):
     if old is None or old == 0 or not (new == new) or not (old == old):
@@ -255,7 +272,7 @@ def evaluate_alerts(items, total):
     save_json(STATE_FILE, {"portfolio": {"total": total}, "assets": new_assets})
     return alerts
 
-# ============================ Indikatoren ============================
+# ----------------------------- Indikatoren ----------------------------
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -278,31 +295,13 @@ def macd(series: pd.Series, fast=12, slow=26, signal=9):
 def sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
 
-# ============================ Universen & Watchlist ============================
-
-BASE_UNIVERSE_STOCKS = [
-    "SPY","QQQ","IWM","XLF","XLE","SOXX","XLK","XLV",
-    "AAPL","MSFT","NVDA","AMD","ASML.AS","KO","OXY",
-    "VUSD.L","VUAA.L","SWDA.L","LQQ.PA","CHIP.PA","HYQ.DE","BRN.AX","DAPP.AS","FVRR",
-]
-BASE_UNIVERSE_CRYPTO = ["bitcoin","ethereum","solana","ripple","cardano","chainlink"]
-
-EXTRA_UNIVERSE_STOCKS = ["TSLA","META","AMZN","GOOGL","NFLX","MU","AVGO","SMH","CORN","URA"]
-EXTRA_UNIVERSE_CRYPTO = ["avalanche-2","polkadot","uniswap","litecoin","optimism","arbitrum"]
+# ----------------------------- Watchlist Auto-Sync --------------------
 
 def sync_watchlist_from_positions(max_stocks=None, max_crypto=None):
-    """
-    Aktualisiert watchlist.json automatisch:
-    - Nimmt Ticker aus positions.json
-    - Mischt Basis-Universum dazu
-    - Optional erweitert (EXPAND_UNIVERSE=true)
-    - Dedupliziert & begrenzt auf MAX_* (Env mit Defaults)
-    """
-    # Maxima aus ENV (breite Scans)
-    if max_stocks is None:
-        max_stocks = int(os.getenv("MAX_STOCKS", "60"))
-    if max_crypto is None:
-        max_crypto = int(os.getenv("MAX_CRYPTO", "30"))
+    """Erzeugt/aktualisiert watchlist.json aus positions + Basis (+ optional Extra)."""
+    # Defaults aus ENV oder Standardwerten
+    max_stocks = int(os.getenv("MAX_STOCKS", str(max_stocks if max_stocks else 80)))
+    max_crypto = int(os.getenv("MAX_CRYPTO", str(max_crypto if max_crypto else 40)))
 
     pos = load_positions()
     pos_stocks = [_norm_code(s.get("ticker","")) for s in pos.get("stocks", []) if s.get("ticker")]
@@ -326,10 +325,10 @@ def sync_watchlist_from_positions(max_stocks=None, max_crypto=None):
     return wl
 
 def load_watchlist():
-    # Vor jedem Scan synchronisieren
+    # vor jedem Scan synchronisieren
     return sync_watchlist_from_positions()
 
-# ============================ Chancenfinder ============================
+# ----------------------------- Scoring & Scanner ----------------------
 
 def score_stock(ticker: str) -> dict | None:
     close = yf_history(ticker, period="6mo", interval="1d")
@@ -347,20 +346,19 @@ def score_stock(ticker: str) -> dict | None:
     ret_7d = (last / float(close.iloc[-7]) - 1) * 100 if len(close) >= 8 else 0.0
     ret_30d = (last / float(close.iloc[-30]) - 1) * 100 if len(close) >= 31 else 0.0
 
-    score = 0
-    notes = []
+    score = 0; notes = []
 
-    if (not math.isnan(sma200_l)) and (last > sma50_l > sma200_l):
+    if not math.isnan(sma200_l) and (last > sma50_l > sma200_l):
         score += 2; notes.append("Trend ↑ (Preis>SMA50>SMA200)")
     elif not math.isnan(sma50_l) and last > sma50_l:
         score += 1; notes.append("Trend ↑ (Preis>SMA50)")
 
-    if not math.isnan(rsi14) and 35 <= rsi14 <= 60:
+    if 35 <= rsi14 <= 60:
         score += 1; notes.append(f"RSI {rsi14:.0f}")
-    elif not math.isnan(rsi14) and rsi14 < 30:
+    elif rsi14 < 30:
         score += 1; notes.append(f"RSI {rsi14:.0f} (überverkauft)")
 
-    if (macd_last > signal_last) and (hist_last > 0):
+    if macd_last > signal_last and hist_last > 0:
         score += 1; notes.append("MACD bullisch")
 
     if ret_7d > 2: score += 1; notes.append(f"7d {ret_7d:+.1f}%")
@@ -393,8 +391,7 @@ def score_crypto(coin_id: str) -> dict | None:
     ret_7d = (last / float(close.iloc[-7]) - 1) * 100 if len(close) >= 8 else 0.0
     ret_30d = (last / float(close.iloc[-30]) - 1) * 100 if len(close) >= 31 else 0.0
 
-    score = 0
-    notes = []
+    score = 0; notes = []
 
     if last > sma50_l > sma200_l:
         score += 2; notes.append("Trend ↑ (Preis>SMA50>SMA200)")
@@ -413,8 +410,8 @@ def score_crypto(coin_id: str) -> dict | None:
     if ret_30d > 6: score += 1; notes.append(f"30d {ret_30d:+.1f}%")
 
     entry_hint = None
-    dist = (last / sma20_l - 1) * 100
-    if abs(dist) <= 2.5:
+    dist = (last / sma20_l - 1) * 100 if sma20_l else float("nan")
+    if not math.isnan(dist) and abs(dist) <= 2.5:
         entry_hint = f"Nahe SMA20 (Δ {dist:+.1f}%)"
         score += 1
 
@@ -424,21 +421,23 @@ def score_crypto(coin_id: str) -> dict | None:
         "entry_hint": entry_hint
     }
 
-def suggest_position_sizes(total_value: float, risk_level: str = "balanced", max_positions: int = 10):
+def suggest_position_sizes(total_value: float, risk_level: str = "balanced"):
+    """Positionsgröße je neuem Setup (Depotpuffer wird respektiert)."""
     pct_map = {"conservative": 0.02, "balanced": 0.03, "aggressive": 0.05}
     base_pct = pct_map.get(risk_level, 0.03)
     per_trade_eur = total_value * base_pct
     min_depot = 1500.0
     safety_buffer = max(total_value - min_depot, 0)
-    per_trade_eur = min(per_trade_eur, safety_buffer * 0.2)  # max 20% des Puffers
-    return max(round(per_trade_eur, 2), 0.0)
+    per_trade_eur = min(per_trade_eur, safety_buffer * 0.2)
+    return round(per_trade_eur, 2)
 
 def job_scanner():
-    wl = load_watchlist()  # vorher auto-sync
+    wl = load_watchlist()  # synchronisiert vorher automatisch
     items, total = compute_portfolio()
     if total <= 0:
         return
 
+    # Scoring
     scored_stocks, scored_crypto = [], []
     for t in wl["stocks"]:
         res = score_stock(t)
@@ -447,6 +446,7 @@ def job_scanner():
         res = score_crypto(c)
         if res: scored_crypto.append(res)
 
+    # Top-Auswahl
     top_s = sorted(scored_stocks, key=lambda x: x["score"], reverse=True)[:3]
     top_c = sorted(scored_crypto, key=lambda x: x["score"], reverse=True)[:3]
 
@@ -466,14 +466,14 @@ def job_scanner():
     lines = []
     if top_s:
         lines.append("📈 Aktien/ETFs – Top Setups:")
-        for e in top_s: lines.append("• " + fmt(e))
+        lines += ["• " + fmt(e) for e in top_s]
     if top_c:
         lines.append("\n🪙 Krypto – Top Setups:")
-        for e in top_c: lines.append("• " + fmt(e))
+        lines += ["• " + fmt(e) for e in top_c]
 
     notify("Chancenfinder – neue Reinvest-Ideen", "\n".join(lines))
 
-# ============================ Jobs ============================
+# ----------------------------- Jobs ----------------------------------
 
 def job_daily_summary():
     items, total = compute_portfolio()
@@ -484,6 +484,41 @@ def job_intraday_monitor():
     t = datetime.now(TZ).time()
     if not (t >= datetime.strptime("06:10", "%H:%M").time() and t <= datetime.strptime("22:00", "%H:%M").time()):
         items, total = compute_portfolio()
-        _ = evaluate_alerts(items, total)
+        _ = evaluate_alerts(items, total)  # Offhours: nur Zustand aktualisieren
         return
+    items, total = compute_portfolio()
+    alerts = evaluate_alerts(items, total)
+    if alerts:
+        notify("Intraday-Alarm", "\n".join(alerts))
 
+def main():
+    print(f"[{now_str()}] Agent gestartet.")
+    # Watchlist initial synchronisieren (zieht MAX_STOCKS/MAX_CRYPTO/EXPAND_UNIVERSE aus .env)
+    sync_watchlist_from_positions()
+
+    if not os.path.exists(STATE_FILE):
+        items, total = compute_portfolio()
+        save_json(STATE_FILE, {"portfolio": {"total": total},
+                               "assets": { (it['code'] or it['name']): {"price": it["price"], "high": it["price"], "low": it["price"]} for it in items }})
+        print(f"[{now_str()}] Initialer Zustand gespeichert.")
+
+    sched = BlockingScheduler(timezone=TZ)
+
+    # 06:30 täglicher Report
+    sched.add_job(job_daily_summary, CronTrigger(hour=6, minute=30))
+
+    # Intraday-Checks alle 15 Min (Mo–Fr)
+    sched.add_job(job_intraday_monitor, CronTrigger(day_of_week='mon-fri', hour='6-22', minute='*/15'))
+
+    # Chancenfinder 4×/Tag
+    for hh, mm in [(7,15),(12,15),(16,15),(20,15)]:
+        sched.add_job(job_scanner, CronTrigger(day_of_week='mon-sun', hour=hh, minute=mm))
+
+    print(f"[{now_str()}] Scheduler aktiv. Warte auf Jobs …")
+    try:
+        sched.start()
+    except (KeyboardInterrupt, SystemExit):
+        print(f"[{now_str()}] Agent gestoppt.")
+
+if __name__ == "__main__":
+    main()
