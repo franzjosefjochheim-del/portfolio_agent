@@ -1,14 +1,22 @@
-# monitor.py — Portfolio-Agent (Render)
+# monitor.py — Portfolio-Agent (Render, quiet logs edition)
 #
-# Version: "clean-low-noise + cg-cache"
+# Änderungen ggü. letzter Version:
+# - CoinGecko 429 wird NICHT mehr geloggt (kein roter Spam alle 15min)
+# - yfinance "Failed to get ticker ... possibly delisted" wird unterdrückt
+#   durch yfinance-Logger auf CRITICAL und kein eigenes print bei normalem Miss
+# - Nur noch wirklich wichtige Prints (Start, Scheduler, Alerts/Reports)
 #
-# Haupt-Änderung ggü. letzter Version:
-# - CoinGecko wird gedrosselt + gecacht, damit keine 429-Orgie im Log
-# - 429 von Coingecko -> nur DBG statt WARN
-# - Falls Coingecko blockt, nehmen wir letzten bekannten Preis aus STATE_FILE,
-#   damit der Bot trotzdem Depotwert und Scanner rechnen kann.
+# Features bleiben:
+# - Tagesbericht 06:30
+# - Intraday-Überwachung 06:10–22:00 (Mo–Fr)
+# - Chancenfinder 4×/Tag
+# - Trailing-Stop / Take-Profit Checks
+# - Auto-Watchlist US-only Stocks + deine Kryptos
+# - Telegram-Push
+# - Alpaca bevorzugt für US-Preise, Fallback yfinance
+# - CoinGecko gecacht, damit wir Portfolio-Wert auch bei Rate Limit weiterrechnen können
 
-import os, json, time, math, re
+import os, json, time, math, re, logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -19,6 +27,10 @@ import pandas as pd
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+# yfinance logger stummschalten, sonst spammt es "possibly delisted"
+yf_logger = logging.getLogger("yfinance")
+yf_logger.setLevel(logging.CRITICAL)
 
 # ----------------------------- Konfiguration -----------------------------
 
@@ -32,27 +44,25 @@ MAX_JUMP_PCT  = float(os.getenv("MAX_JUMP_PCT", "50"))
 ASSET_MOVE_PCT = float(os.getenv("ASSET_MOVE_PCT", "2"))
 PORT_MOVE_PCT  = float(os.getenv("PORT_MOVE_PCT", "1"))
 
-# CoinGecko Rate Limit
+# CoinGecko Rate Limit Handling
 CG_MIN_INTERVAL_SEC = float(os.getenv("CG_MIN_INTERVAL_SEC", "20"))
-# zusätzliche globale Start-Verzögerung für alle Krypto-Calls nach Prozess-Start
-CG_GLOBAL_GRACE_SEC = 30.0
+CG_GLOBAL_GRACE_SEC = 30.0  # nach Prozessstart erstmal nix hammern
 _PROCESS_START_TS = time.time()
 
-# wir halten pro Coin Timestamp letzter erfolgreicher Anfrage
-_last_cg_call = {}
-# wir halten auch Cache der letzten bekannten Preise/Verläufe
-_cg_price_cache = {}
-_cg_history_cache = {}
+_last_cg_call = {}        # pro Coin, wann zuletzt live abgefragt
+_cg_price_cache = {}      # letzter bekannter Preis pro Coin
+_cg_history_cache = {}    # letzter bekannter History-TS pro Coin (Series)
 
-# yfinance Pause
+# yfinance Call-Pause zwischen tickern (ms)
 YF_PAUSE_MS = int(os.getenv("YF_PAUSE_MS", "400"))
 
-# Alpaca
+# Alpaca Zugang
 ALPACA_ENABLED = os.getenv("ALPACA_ENABLED", "false").lower() in ("1","true","yes","y")
 APCA_API_BASE_URL = os.getenv("APCA_API_BASE_URL", "").rstrip("/")
 APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID", "")
 APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY", "")
 
+# Wir ignorieren absichtlich London/HK/Paris Ticker usw.
 US_LIVE_TICKERS_ONLY = True
 
 BASE_UNIVERSE_STOCKS = [
@@ -101,15 +111,21 @@ def _sleep_ms(ms):
 # ----------------------------- Preisquellen Aktien ---------------------
 
 def alpaca_last_price(ticker: str) -> float:
+    """
+    Versucht Alpaca-Quote (oder letzter Trade). Wenn kein Preis -> NaN.
+    Wir loggen KEINE Warns hier, außer echter Exception.
+    """
     if not (ALPACA_ENABLED and APCA_API_BASE_URL and APCA_API_KEY_ID and APCA_API_SECRET_KEY):
         return float("nan")
     if "." in ticker:
+        # Alpaca kann z.B. 'VUSD.L' eh nicht
         return float("nan")
     headers = {
         "APCA-API-KEY-ID": APCA_API_KEY_ID,
         "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
     }
     try:
+        # Quotes
         url = f"{APCA_API_BASE_URL}/v2/stocks/{ticker}/quotes/latest"
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
@@ -119,6 +135,7 @@ def alpaca_last_price(ticker: str) -> float:
             if bp is not None and ap is not None and ap > 0:
                 return float((bp + ap) / 2.0)
 
+        # Trades
         url = f"{APCA_API_BASE_URL}/v2/stocks/{ticker}/trades/latest"
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
@@ -127,12 +144,18 @@ def alpaca_last_price(ticker: str) -> float:
             if px is not None:
                 return float(px)
 
+        # Wenn Alpaca den Ticker nicht kennt => still
         return float("nan")
-    except Exception as e:
-        print(f"[{now_str()}] DBG alpaca {ticker}: {e}")
+    except Exception:
+        # echte Netzwerk/JSON Fehler -> einmal kurze Debug-Ausgabe
+        print(f"[{now_str()}] DBG alpaca exception for {ticker}")
         return float("nan")
 
 def yf_price_us_only(ticker: str) -> float:
+    """
+    Holt letzten Preis aus yfinance (US only).
+    Keine Warn-Prints bei "kein Ticker".
+    """
     if "." in ticker:
         return float("nan")
     try:
@@ -143,11 +166,16 @@ def yf_price_us_only(ticker: str) -> float:
         hist = t.history(period="1d", interval="1d")
         if not hist.empty:
             return float(hist["Close"].iloc[-1])
-    except Exception as e:
-        print(f"[{now_str()}] DBG yfinance {ticker}: {e}")
+    except Exception:
+        # yfinance kann hart failen z.B. Rate Limit -> still
+        return float("nan")
     return float("nan")
 
 def yf_history_us_only(ticker: str, period="6mo", interval="1d") -> pd.Series:
+    """
+    Für Scanner (RSI/MACD). Wenn nix kommt: leere Series,
+    kein lautstarkes Logging.
+    """
     if "." in ticker:
         return pd.Series(dtype=float)
     try:
@@ -155,11 +183,17 @@ def yf_history_us_only(ticker: str, period="6mo", interval="1d") -> pd.Series:
         h = t.history(period=period, interval=interval)
         if not h.empty:
             return h["Close"].dropna()
-    except Exception as e:
-        print(f"[{now_str()}] DBG yfinance history {ticker}: {e}")
+    except Exception:
+        return pd.Series(dtype=float)
     return pd.Series(dtype=float)
 
 def get_stock_price(ticker: str) -> float:
+    """
+    Priorität:
+    1. Alpaca
+    2. yfinance
+    Ergebnis NaN falls nix.
+    """
     px = alpaca_last_price(ticker)
     if px == px and px > 0:
         return px
@@ -173,13 +207,15 @@ def get_stock_price(ticker: str) -> float:
 
 def _load_state_for_crypto_cache():
     """
-    Holt aus STATE_FILE alte Preise, falls verfügbar,
-    damit wir bei 429 nicht komplett blind sind.
+    Holt alte Preise aus STATE_FILE (damit wir bei 429 noch was haben).
     """
     st = load_json(STATE_FILE, {"crypto_cache": {}})
     return st.get("crypto_cache", {})
 
 def _save_state_crypto_cache():
+    """
+    Speichert _cg_price_cache zurück in STATE_FILE.
+    """
     st = load_json(STATE_FILE, {})
     if "crypto_cache" not in st:
         st["crypto_cache"] = {}
@@ -192,37 +228,39 @@ def _save_state_crypto_cache():
 
 def _cg_allowed_now(coin_id: str) -> bool:
     """
-    Gibt True, wenn wir CoinGecko für diesen Coin JETZT wieder anfragen dürfen.
-    Kriterien:
-    - Global Grace: in den ersten CG_GLOBAL_GRACE_SEC Sek nach Start -> False
-      (damit wir beim Deploy nicht ALLE Coins gleichzeitig abfeuern).
-    - lokaler Cooldown: mindestens CG_MIN_INTERVAL_SEC seit letztem Call.
+    Drossel: CoinGecko nur alle CG_MIN_INTERVAL_SEC pro Coin
+    + in den ersten CG_GLOBAL_GRACE_SEC nach Start alles unterdrücken,
+      damit beim Deploy kein Burst kommt.
     """
     now_ts = time.time()
     if now_ts - _PROCESS_START_TS < CG_GLOBAL_GRACE_SEC:
-        # wir sind noch in der "Startup-Gnadenfrist": lieber nichts fetzen
         return False
-
     last = _last_cg_call.get(coin_id, 0)
     if now_ts - last < CG_MIN_INTERVAL_SEC:
         return False
     return True
 
 def coingecko_price(coin_id: str) -> float:
-    # 1. Cache-Rückgabe, falls wir kürzlich was hatten
-    if coin_id in _cg_price_cache:
-        cached = _cg_price_cache[coin_id]
-        if "price" in cached:
-            return float(cached["price"])
+    """
+    Preis in EUR pro Coin.
+    Strategie:
+      - Wenn Cache vorhanden, gib Cache
+      - Wenn wir noch nicht wieder fragen dürfen: versuch STATE-Fallback
+      - Wenn wir fragen dürfen: Call -> Cache -> STATE
+      - Bei Fehler/429: KEIN print (wir bleiben still), nur Fallback
+    """
+    # 1. lokaler RAM-Cache first
+    if coin_id in _cg_price_cache and "price" in _cg_price_cache[coin_id]:
+        return float(_cg_price_cache[coin_id]["price"])
 
-    # 2. wenn wir nicht dürfen -> versuch aus STATE_FILE alten Wert zurückzugeben
+    # 2. dürfen wir nicht? -> STATE fallback
     if not _cg_allowed_now(coin_id):
         old_prices = _load_state_for_crypto_cache()
         if coin_id in old_prices and "price" in old_prices[coin_id]:
             return float(old_prices[coin_id]["price"])
         return float("nan")
 
-    # 3. wir dürfen -> echten Call versuchen
+    # 3. echter Call
     try:
         url = "https://api.coingecko.com/api/v3/simple/price"
         r = requests.get(url, params={"ids": coin_id, "vs_currencies": "eur"}, timeout=20)
@@ -232,25 +270,26 @@ def coingecko_price(coin_id: str) -> float:
         _cg_price_cache[coin_id] = {"price": px, "ts": _last_cg_call[coin_id]}
         _save_state_crypto_cache()
         return px
-    except Exception as e:
-        # 429 / whatever -> nur DBG statt WARN
-        print(f"[{now_str()}] DBG coingecko {coin_id}: {e}")
-        # versuch Fallback aus STATE_FILE
+    except Exception:
+        # CoinGecko 429 oder Netzfehler -> still fallback
         old_prices = _load_state_for_crypto_cache()
         if coin_id in old_prices and "price" in old_prices[coin_id]:
             return float(old_prices[coin_id]["price"])
         return float("nan")
 
 def coingecko_history(coin_id: str, days=180) -> pd.Series:
-    # 1. Falls wir schon nen Cache für history haben, nimm den
+    """
+    Historie für RSI/MACD etc.
+    - Wenn Cache vorhanden: nimm Cache.
+    - Wenn wir nicht dürfen: leere Series (Scanner kriegt dann einfach kein Setup).
+    - Bei Fehler/429: leere Series (still).
+    """
     if coin_id in _cg_history_cache and not _cg_history_cache[coin_id].empty:
         return _cg_history_cache[coin_id]
 
-    # 2. Wenn wir grad nicht dürfen -> gib leere Series (Scanner kann dann None zurückliefern)
     if not _cg_allowed_now(coin_id):
         return pd.Series(dtype=float)
 
-    # 3. echter Call
     try:
         url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
         r = requests.get(url, params={"vs_currency": "eur", "days": days}, timeout=30)
@@ -258,6 +297,7 @@ def coingecko_history(coin_id: str, days=180) -> pd.Series:
         prices = r.json().get("prices", [])
         if not prices:
             return pd.Series(dtype=float)
+
         ts = [pd.to_datetime(p[0], unit="ms") for p in prices]
         vals = [float(p[1]) for p in prices]
         s = pd.Series(vals, index=pd.DatetimeIndex(ts, tz="UTC")).tz_convert(TZ)
@@ -266,9 +306,7 @@ def coingecko_history(coin_id: str, days=180) -> pd.Series:
         _last_cg_call[coin_id] = time.time()
         _cg_history_cache[coin_id] = s
         return s
-    except Exception as e:
-        print(f"[{now_str()}] DBG cg history {coin_id}: {e}")
-        # kein guter Fallback für History -> gib leer
+    except Exception:
         return pd.Series(dtype=float)
 
 def get_crypto_price(symbol: str) -> float:
@@ -291,9 +329,15 @@ def send_telegram(msg: str):
         }
         requests.post(url, data=payload, timeout=15)
     except Exception as e:
+        # Telegram sollte eigentlich laufen; falls nicht, EINmal laut sagen
         print(f"[{now_str()}] WARN telegram: {e}")
 
 def notify(title: str, text: str):
+    """
+    Das ist der EINZIGE "laute" Kanal.
+    Alles Wichtige (Alarme, Tagesbericht, Scanner-Ergebnis)
+    geht über print() UND Telegram.
+    """
     header = f"📣 {title}\n{now_str()}\n\n{text}"
     print(header)
     send_telegram(header)
@@ -352,6 +396,10 @@ def _compute_portfolio_raw():
     return items, total
 
 def compute_portfolio():
+    """
+    Portfolio mit Failover:
+    - wenn total==0 oder Sprung > MAX_JUMP_PCT: einmal 2s warten & Retry
+    """
     items, total = _compute_portfolio_raw()
 
     state = load_json(STATE_FILE, {"portfolio": {"total": None}})
@@ -485,7 +533,6 @@ def evaluate_alerts(items, total):
         {
             "portfolio": {"total": total},
             "assets": new_assets,
-            # crypto_cache speichern wir über _save_state_crypto_cache separat
             "crypto_cache": load_json(STATE_FILE, {}).get("crypto_cache", {})
         }
     )
@@ -517,6 +564,10 @@ def sma(series: pd.Series, window: int) -> pd.Series:
 # ----------------------------- Watchlist ------------------------------
 
 def sync_watchlist_from_positions(max_stocks=None, max_crypto=None):
+    """
+    Baut watchlist.json neu anhand deines echten Depots + Basisuniversum (US only).
+    London/HK/Paris-Ticker werden gefiltert raus.
+    """
     max_stocks = int(os.getenv("MAX_STOCKS", str(max_stocks if max_stocks else 30)))
     max_crypto = int(os.getenv("MAX_CRYPTO", str(max_crypto if max_crypto else 10)))
 
@@ -556,17 +607,18 @@ def score_stock(ticker: str) -> dict | None:
 
     last = float(close.iloc[-1])
     rsi14 = float(rsi(close, 14).iloc[-1])
-    macd_line, signal_line, hist = macd(close)
-    macd_last = float(macd_line.iloc[-1])
-    signal_last = float(signal_line.iloc[-1])
-    hist_last = float(hist.iloc[-1])
 
-    sma20 = sma(close, 20)
-    sma50 = sma(close, 50)
+    macd_line, signal_line, hist = macd(close)
+    macd_last    = float(macd_line.iloc[-1])
+    signal_last  = float(signal_line.iloc[-1])
+    hist_last    = float(hist.iloc[-1])
+
+    sma20  = sma(close, 20)
+    sma50  = sma(close, 50)
     sma200 = sma(close, 200)
 
-    sma20_l  = float(sma20.iloc[-1]) if not np.isnan(sma20.iloc[-1]) else float("nan")
-    sma50_l  = float(sma50.iloc[-1]) if not np.isnan(sma50.iloc[-1]) else float("nan")
+    sma20_l  = float(sma20.iloc[-1])  if not np.isnan(sma20.iloc[-1])  else float("nan")
+    sma50_l  = float(sma50.iloc[-1])  if not np.isnan(sma50.iloc[-1])  else float("nan")
     sma200_l = float(sma200.iloc[-1]) if not np.isnan(sma200.iloc[-1]) else float("nan")
 
     ret_7d  = (last / float(close.iloc[-7])  - 1) * 100 if len(close) >= 8  else 0.0
@@ -615,15 +667,16 @@ def score_crypto(coin_id: str) -> dict | None:
     if close.empty or len(close) < 50:
         return None
 
-    last = float(close.iloc[-1])
+    last  = float(close.iloc[-1])
     rsi14 = float(rsi(close, 14).iloc[-1])
-    macd_line, signal_line, hist = macd(close)
-    macd_last = float(macd_line.iloc[-1])
-    signal_last = float(signal_line.iloc[-1])
-    hist_last = float(hist.iloc[-1])
 
-    sma20 = sma(close, 20)
-    sma50 = sma(close, 50)
+    macd_line, signal_line, hist = macd(close)
+    macd_last   = float(macd_line.iloc[-1])
+    signal_last = float(signal_line.iloc[-1])
+    hist_last   = float(hist.iloc[-1])
+
+    sma20  = sma(close, 20)
+    sma50  = sma(close, 50)
     sma200 = sma(close, 200)
 
     sma20_l  = float(sma20.iloc[-1])
@@ -733,6 +786,10 @@ def job_daily_summary():
     notify("Tagesbericht", report)
 
 def job_intraday_monitor():
+    """
+    Alle 15min (Mo-Fr 06:10–22:00) → prüft Bewegungen/Stops
+    Außerhalb der Zeiten: still updaten aber kein Push.
+    """
     t = datetime.now(TZ).time()
     if not (t >= datetime.strptime("06:10", "%H:%M").time() and
             t <= datetime.strptime("22:00", "%H:%M").time()):
@@ -743,6 +800,7 @@ def job_intraday_monitor():
     items, total = compute_portfolio()
 
     if total < MIN_ALERT_EUR:
+        # Nur State refreshen, kein Spam wenn Depot klein ist
         state = load_json(STATE_FILE, {"portfolio": {"total": None}, "assets": {}, "crypto_cache": {}})
         save_json(
             STATE_FILE,
@@ -761,14 +819,16 @@ def job_intraday_monitor():
 def main():
     print(f"[{now_str()}] Agent gestartet. Alpaca={'on' if ALPACA_ENABLED else 'off'}")
 
-    # ensure caches are in sync from STATE_FILE at boot
+    # Crypto-Cache aus STATE_FILE reinziehen (damit wir sofort Preise haben ohne CG-Hit)
     old_crypto_cache = _load_state_for_crypto_cache()
     for sym, d in old_crypto_cache.items():
         if "price" in d:
             _cg_price_cache[sym] = {"price": d["price"], "ts": d.get("ts", time.time())}
 
+    # Watchlist syncen (filtert automatisch nur US-stocks u. deine coins)
     sync_watchlist_from_positions()
 
+    # STATE_FILE initialisieren falls nicht vorhanden (nur 1x nach neuem Deploy)
     if not os.path.exists(STATE_FILE):
         items, total = compute_portfolio()
         save_json(
@@ -791,10 +851,16 @@ def main():
         )
         print(f"[{now_str()}] Initialer Zustand gespeichert.")
 
+    # Scheduler konfigurieren
     sched = BlockingScheduler(timezone=TZ)
 
+    # 06:30 täglicher Report
     sched.add_job(job_daily_summary, CronTrigger(hour=6, minute=30))
+
+    # Intraday-Checks alle 15 Min (Mo–Fr)
     sched.add_job(job_intraday_monitor, CronTrigger(day_of_week='mon-fri', hour='6-22', minute='*/15'))
+
+    # Chancenfinder 4×/Tag
     for hh, mm in [(7,15),(12,15),(16,15),(20,15)]:
         sched.add_job(job_scanner, CronTrigger(day_of_week='mon-sun', hour=hh, minute=mm))
 
