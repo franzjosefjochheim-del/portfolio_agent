@@ -1,27 +1,154 @@
 {
   "stocks": [
-    {"name": "Brainchip Holdings Ltd.", "ticker": "BRN.AX", "quantity": 645.714285, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "Hypoport SE", "ticker": "HYQ.DE", "quantity": 0.501002, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "MUF-Amundi Nasdaq-100 2x Lev", "ticker": "LQQ.PA", "quantity": 0.281243, "stop_loss_pct": 6, "take_profit_pct": 12},
-    {"name": "Vanguard S&P 500 UCITS ETF Dis", "ticker": "VUSD.L", "quantity": 2.00531, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "iShares S&P 500 Financials ETF", "ticker": "IYF", "quantity": 3.536067, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "iShares Core MSCI World ETF", "ticker": "SWDA.L", "quantity": 4.202565, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "Vanguard S&P 500 UCITS ETF Acc", "ticker": "VUAA.L", "quantity": 0.92302, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "VanEck Crypto & Blockchain Innov.", "ticker": "DAPP.AS", "quantity": 4.451486, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "Fiverr International Ltd.", "ticker": "FVRR", "quantity": 2.64529, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "Geely Automobile Holdings Ltd.", "ticker": "0175.HK", "quantity": 76.086956, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "Xpeng Inc.", "ticker": "9868.HK", "quantity": 11.655011, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "Amundi MSCI Semiconductor UE", "ticker": "CHIP.PA", "quantity": 2.855641, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "Coca-Cola Co.", "ticker": "KO", "quantity": 2.044547, "stop_loss_pct": 0, "take_profit_pct": 8},
-    {"name": "NVIDIA Corp.", "ticker": "NVDA", "quantity": 2.768886, "stop_loss_pct": 10, "take_profit_pct": 15},
-    {"name": "Occidental Petroleum Corp.", "ticker": "OXY", "quantity": 0.723366, "stop_loss_pct": 0, "take_profit_pct": 0}
+    {
+      "name": "Brainchip Holdings Ltd",
+      "ticker": "BRN.AX",
+      "quantity": 645.714285,
+      "stop_loss_pct": 30,
+      "take_profit_pct": 50
+    },
+    {
+      "name": "Hypoport SE",
+      "ticker": "HYQ.DE",
+      "quantity": 0.501002,
+      "stop_loss_pct": 25,
+      "take_profit_pct": 40
+    },
+    {
+      "name": "Amundi Nasdaq-100 2x Leveraged",
+      "ticker": "LQQ.PA",
+      "quantity": 0.281243,
+      "stop_loss_pct": 25,
+      "take_profit_pct": 40
+    },
+    {
+      "name": "Vanguard S&P 500 UCITS ETF (Distributing)",
+      "ticker": "VUSD.L",
+      "quantity": 2.00531,
+      "stop_loss_pct": 0,
+      "take_profit_pct": 0
+    },
+    {
+      "name": "iShares US Financials ETF",
+      "ticker": "IYF",
+      "quantity": 3.536067,
+      "stop_loss_pct": 15,
+      "take_profit_pct": 25
+    },
+    {
+      "name": "iShares Core MSCI World UCITS (Acc)",
+      "ticker": "SWDA.L",
+      "quantity": 4.202565,
+      "stop_loss_pct": 0,
+      "take_profit_pct": 0
+    },
+    {
+      "name": "Vanguard S&P 500 UCITS ETF (Acc)",
+      "ticker": "VUAA.L",
+      "quantity": 0.92302,
+      "stop_loss_pct": 0,
+      "take_profit_pct": 0
+    },
+    {
+      "name": "VanEck Crypto & Blockchain Innovators",
+      "ticker": "DAPP.AS",
+      "quantity": 4.451486,
+      "stop_loss_pct": 25,
+      "take_profit_pct": 40
+    },
+    {
+      "name": "Fiverr International Ltd",
+      "ticker": "FVRR",
+      "quantity": 2.64529,
+      "stop_loss_pct": 15,
+      "take_profit_pct": 25
+    },
+    {
+      "name": "Geely Automobile Holdings Ltd",
+      "ticker": "0175.HK",
+      "quantity": 76.086956,
+      "stop_loss_pct": 25,
+      "take_profit_pct": 40
+    },
+    {
+      "name": "XPeng Inc.",
+      "ticker": "9868.HK",
+      "quantity": 11.655011,
+      "stop_loss_pct": 25,
+      "take_profit_pct": 40
+    },
+    {
+      "name": "Amundi MSCI Semiconductor ETF",
+      "ticker": "CHIP.PA",
+      "quantity": 2.855641,
+      "stop_loss_pct": 20,
+      "take_profit_pct": 30
+    },
+    {
+      "name": "Coca-Cola Co.",
+      "ticker": "KO",
+      "quantity": 2.044547,
+      "stop_loss_pct": 15,
+      "take_profit_pct": 25
+    },
+    {
+      "name": "NVIDIA Corp.",
+      "ticker": "NVDA",
+      "quantity": 2.768886,
+      "stop_loss_pct": 15,
+      "take_profit_pct": 25
+    },
+    {
+      "name": "Occidental Petroleum Corp.",
+      "ticker": "OXY",
+      "quantity": 0.723366,
+      "stop_loss_pct": 15,
+      "take_profit_pct": 25
+    }
   ],
+
   "crypto": [
-    {"name": "Cardano", "symbol": "cardano", "quantity": 28.124459, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "Solana", "symbol": "solana", "quantity": 0.242274, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "XRP", "symbol": "ripple", "quantity": 266.779011, "stop_loss_pct": 0, "take_profit_pct": 0},
-    {"name": "Bitcoin", "symbol": "bitcoin", "quantity": 0.000885, "stop_loss_pct": 12, "take_profit_pct": 18},
-    {"name": "Ethereum", "symbol": "ethereum", "quantity": 0.111043, "stop_loss_pct": 12, "take_profit_pct": 18},
-    {"name": "Chainlink", "symbol": "chainlink", "quantity": 2.802825, "stop_loss_pct": 0, "take_profit_pct": 0}
+    {
+      "name": "Cardano",
+      "symbol": "cardano",
+      "quantity": 28.124459,
+      "stop_loss_pct": 20,
+      "take_profit_pct": 35
+    },
+    {
+      "name": "Solana",
+      "symbol": "solana",
+      "quantity": 0.242274,
+      "stop_loss_pct": 20,
+      "take_profit_pct": 35
+    },
+    {
+      "name": "XRP",
+      "symbol": "ripple",
+      "quantity": 266.779011,
+      "stop_loss_pct": 20,
+      "take_profit_pct": 35
+    },
+    {
+      "name": "Bitcoin",
+      "symbol": "bitcoin",
+      "quantity": 0.000885,
+      "stop_loss_pct": 20,
+      "take_profit_pct": 35
+    },
+    {
+      "name": "Ethereum",
+      "symbol": "ethereum",
+      "quantity": 0.111043,
+      "stop_loss_pct": 20,
+      "take_profit_pct": 35
+    },
+    {
+      "name": "Chainlink",
+      "symbol": "chainlink",
+      "quantity": 2.802825,
+      "stop_loss_pct": 20,
+      "take_profit_pct": 35
+    }
   ]
 }
