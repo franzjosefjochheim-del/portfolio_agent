@@ -1,4 +1,4 @@
-# monitor.py  — Portfolio-Agent (Render/Replit/Lokal) mit Alpaca-Datenfeed + Fallback
+# monitor.py  — Portfolio-Agent (Render/Replit/Lokal) mit Alpaca-Datenfeed + yfinance-Session-Fix + CoinGecko-Throttle/Cache
 # Features:
 # - Tagesbericht 06:30
 # - Intraday-Überwachung 06:10–22:00 (Mo–Fr) mit Asset- und Portfolio-Alarmen
@@ -6,14 +6,14 @@
 # - Auto-Watchlist (aus positions.json + Basisuniversum + optional Extra)
 # - False-Alarm-Schutz + Top-Mover (Titel/Position) im Intraday-Alarm
 # Daten:
-#   • Stocks/ETFs: Alpaca (wenn Keys gesetzt) → sonst yfinance
-#   • Crypto (EUR): CoinGecko (mit Rate-Limiter)
+#   • Stocks/ETFs: Alpaca (wenn Keys gesetzt) → sonst yfinance (mit eigener Session/Headers)
+#   • Crypto (EUR): CoinGecko (Throttle + 60s Cache)
 # Benachrichtigungen: Telegram (+ optional E-Mail)
 
-import os, json, time, smtplib, ssl, math, re, threading
+import os, json, time, smtplib, ssl, math, re, threading, random
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -31,10 +31,10 @@ STATE_FILE = "last_state.json"
 WATCHLIST_FILE = "watchlist.json"
 
 # False-Alarm-Schutz
-MIN_ALERT_EUR = float(os.getenv("MIN_ALERT_EUR", "500"))   # Mindestgröße für Portfolio-Alarm (alt & neu)
-MAX_JUMP_PCT  = float(os.getenv("MAX_JUMP_PCT", "50"))    # bei >50% Sprung: einmal Retry
+MIN_ALERT_EUR = float(os.getenv("MIN_ALERT_EUR", "500"))
+MAX_JUMP_PCT  = float(os.getenv("MAX_JUMP_PCT", "50"))
 
-# Basis-Universum (Kurzbeispiele, ggf. anpassen)
+# Basis-Universum
 BASE_UNIVERSE_STOCKS = [
     "SPY","QQQ","IWM","XLF","XLE","SOXX","XLK","XLV",
     "AAPL","MSFT","NVDA","AMD","ASML.AS","KO","OXY",
@@ -50,33 +50,28 @@ EXTRA_UNIVERSE_CRYPTO = ["avalanche-2","polkadot","uniswap","litecoin","optimism
 ALPACA_KEY = os.getenv("ALPACA_API_KEY_ID")
 ALPACA_SEC = os.getenv("ALPACA_SECRET_KEY")
 ALPACA_URL = os.getenv("ALPACA_BASE_URL", "https://data.alpaca.markets").rstrip("/")
-
 ALPACA_ENABLED = bool(ALPACA_KEY and ALPACA_SEC)
 
 def alpaca_headers():
     return {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SEC}
 
 def _is_us_symbol(sym: str) -> bool:
-    # einfache Heuristik: Yahoo-Suffixe erkennen (.DE, .L, .PA, .HK, .AS, .MX, .SW etc.)
     return "." not in sym.upper()
 
 def alpaca_stock_price(symbol: str) -> float:
-    # nutzt Latest Trade → Preis (Realtime)
     try:
         if not (ALPACA_ENABLED and _is_us_symbol(symbol)):
             return float("nan")
         url = f"{ALPACA_URL}/v2/stocks/{symbol}/trades/latest"
         r = requests.get(url, headers=alpaca_headers(), timeout=10)
         if r.status_code == 200:
-            data = r.json()
-            p = data.get("trade", {}).get("p")
+            p = r.json().get("trade", {}).get("p")
             return float(p) if p is not None else float("nan")
     except Exception as e:
         print(f"[{now_str()}] WARN alpaca price {symbol}: {e}")
     return float("nan")
 
 def alpaca_stock_history(symbol: str, days=180) -> pd.Series:
-    # 1D Bars, bis zu 200
     try:
         if not (ALPACA_ENABLED and _is_us_symbol(symbol)):
             return pd.Series(dtype=float)
@@ -85,19 +80,33 @@ def alpaca_stock_history(symbol: str, days=180) -> pd.Series:
         params = {"timeframe": "1Day", "limit": limit, "adjustment": "raw"}
         r = requests.get(url, headers=alpaca_headers(), params=params, timeout=15)
         if r.status_code == 200:
-            js = r.json()
-            bars = js.get("bars", [])
+            bars = r.json().get("bars", [])
             if not bars:
                 return pd.Series(dtype=float)
             ts = [pd.to_datetime(b["t"]) for b in bars]
             vals = [float(b["c"]) for b in bars]
-            s = pd.Series(vals, index=pd.DatetimeIndex(ts, tz="UTC")).tz_convert(TZ)
-            return s
+            return pd.Series(vals, index=pd.DatetimeIndex(ts, tz="UTC")).tz_convert(TZ)
     except Exception as e:
         print(f"[{now_str()}] WARN alpaca history {symbol}: {e}")
     return pd.Series(dtype=float)
 
-# (Optional: Alpaca Crypto wäre möglich, aber liefert USD – wir bleiben bei CoinGecko in EUR)
+# ----------------------------- yfinance Session (wichtig) --------------
+
+# Eigene Session mit Browser-Header + Retries → vermeidet Yahoo-Blocks („Expecting value…“)
+YF_SESSION = requests.Session()
+YF_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.8,de;q=0.7",
+    "Connection": "keep-alive",
+})
+try:
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    retry = Retry(total=3, connect=3, backoff_factor=0.4, status_forcelist=[429,500,502,503,504])
+    YF_SESSION.mount("https://", HTTPAdapter(max_retries=retry))
+except Exception:
+    pass
 
 # ----------------------------- Utils ------------------------------------
 
@@ -119,34 +128,33 @@ def _norm_code(x: str) -> str:
     return re.sub(r"\s+", "", str(x or "")).upper()
 
 def _dedup_keep_order(seq):
-    seen = set()
-    out = []
+    seen, out = set(), []
     for x in seq:
         k = _norm_code(x)
         if k and k not in seen:
-            seen.add(k)
-            out.append(k)
+            seen.add(k); out.append(k)
     return out
 
 # ----------------------------- Datenquellen -----------------------------
 
-# --- yfinance (Fallback) ---
+# --- yfinance (mit Session) ---
 def yf_price(ticker: str) -> float:
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker, session=YF_SESSION)
         fi = getattr(t, "fast_info", None)
         if fi and getattr(fi, "last_price", None):
             return float(fi.last_price)
-        hist = t.history(period="1d", interval="1d")
+        # Fallback über kurze Historie (5d) → letzte Close
+        hist = t.history(period="5d", interval="1d")
         if not hist.empty:
-            return float(hist["Close"].iloc[-1])
+            return float(hist["Close"].dropna().iloc[-1])
     except Exception as e:
         print(f"[{now_str()}] WARN yfinance {ticker}: {e}")
     return float("nan")
 
 def yf_history(ticker: str, period="6mo", interval="1d") -> pd.Series:
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker, session=YF_SESSION)
         h = t.history(period=period, interval=interval)
         if not h.empty:
             return h["Close"].dropna()
@@ -154,24 +162,32 @@ def yf_history(ticker: str, period="6mo", interval="1d") -> pd.Series:
         print(f"[{now_str()}] WARN yfinance history {ticker}: {e}")
     return pd.Series(dtype=float)
 
-# --- CoinGecko (mit einfachem Rate-Limiter) ---
+# --- CoinGecko (Throttle + Cache) ---
 _last_cg_lock = threading.Lock()
 _last_cg_ts = 0.0
-def _cg_throttle(min_interval=1.1):
+_cg_cache = {}  # {coin_id: (timestamp, price)}
+
+def _cg_throttle(min_interval=2.5):
     global _last_cg_ts
     with _last_cg_lock:
         dt = time.time() - _last_cg_ts
         if dt < min_interval:
-            time.sleep(min_interval - dt)
+            time.sleep(min_interval - dt + random.uniform(0, 0.2))
         _last_cg_ts = time.time()
 
 def coingecko_price(coin_id: str) -> float:
+    # 60s Cache
+    ts, val = _cg_cache.get(coin_id, (0, None))
+    if val is not None and (time.time() - ts) < 60:
+        return val
     try:
         _cg_throttle()
         url = "https://api.coingecko.com/api/v3/simple/price"
         r = requests.get(url, params={"ids": coin_id, "vs_currencies": "eur"}, timeout=15)
         r.raise_for_status()
-        return float(r.json()[coin_id]["eur"])
+        price = float(r.json()[coin_id]["eur"])
+        _cg_cache[coin_id] = (time.time(), price)
+        return price
     except Exception as e:
         print(f"[{now_str()}] WARN coingecko {coin_id}: {e}")
         return float("nan")
@@ -196,8 +212,7 @@ def coingecko_history(coin_id: str, days=180) -> pd.Series:
 # ----------------------------- Benachrichtigungen ----------------------
 
 def send_telegram(msg: str):
-    token = os.getenv("TG_BOT_TOKEN")
-    chat_id = os.getenv("TG_CHAT_ID")
+    token = os.getenv("TG_BOT_TOKEN"); chat_id = os.getenv("TG_CHAT_ID")
     if not token or not chat_id:
         return
     try:
@@ -208,49 +223,35 @@ def send_telegram(msg: str):
         print(f"[{now_str()}] WARN telegram: {e}")
 
 def send_email(subject: str, body: str):
-    user = os.getenv("EMAIL_USER")
-    pwd  = os.getenv("EMAIL_PASS")
-    to   = os.getenv("EMAIL_TO")
-    smtp = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    port = int(os.getenv("SMTP_PORT", "465"))
+    user = os.getenv("EMAIL_USER"); pwd  = os.getenv("EMAIL_PASS"); to = os.getenv("EMAIL_TO")
+    smtp = os.getenv("SMTP_HOST", "smtp.gmail.com"); port = int(os.getenv("SMTP_PORT", "465"))
     if not (user and pwd and to):
         return
     try:
-        msg = MIMEMultipart()
-        msg["Subject"] = subject
-        msg["From"] = user
-        msg["To"] = to
+        msg = MIMEMultipart(); msg["Subject"] = subject; msg["From"] = user; msg["To"] = to
         msg.attach(MIMEText(body, "plain", "utf-8"))
         ctx = ssl.create_default_context()
         with smtplib.SMTP_SSL(smtp, port, context=ctx) as server:
-            server.login(user, pwd)
-            server.sendmail(user, [to], msg.as_string())
+            server.login(user, pwd); server.sendmail(user, [to], msg.as_string())
     except Exception as e:
         print(f"[{now_str()}] WARN email: {e}")
 
 def notify(title: str, text: str):
     header = f"📣 {title}\n{now_str()}\n\n{text}"
-    print(header)
-    send_telegram(header)
-    send_email(title, header)
+    print(header); send_telegram(header); send_email(title, header)
 
 # ----------------------------- Portfolio-Core -------------------------
 
 def load_positions() -> dict:
-    p = load_json("positions.json", {})
-    p.setdefault("stocks", [])
-    p.setdefault("crypto", [])
-    return p
+    p = load_json("positions.json", {}); p.setdefault("stocks", []); p.setdefault("crypto", []); return p
 
 def price_of(asset: dict) -> float:
-    # STOCKS/ETFs → Alpaca (US) → yfinance
     if "ticker" in asset:
         ticker = asset["ticker"].upper()
         px = alpaca_stock_price(ticker)
         if not (px == px):
             px = yf_price(ticker)
         return px
-    # CRYPTO → CoinGecko (EUR)
     if "symbol" in asset:
         return coingecko_price(asset["symbol"])
     return float("nan")
@@ -262,39 +263,15 @@ def stock_history_prefer_alpaca(ticker: str) -> pd.Series:
     return s
 
 def _compute_portfolio_raw():
-    pos = load_positions()
-    items = []
-
+    pos = load_positions(); items = []
     for s in pos["stocks"]:
-        px = price_of(s)
-        qty = float(s["quantity"])
-        val = px * qty if px == px else float("nan")
-        items.append({
-            "kind": "stock",
-            "name": s["name"],
-            "code": s.get("ticker",""),
-            "qty": qty,
-            "price": px,
-            "value": val,
-            "sl_pct": float(s.get("stop_loss_pct", 0)),
-            "tp_pct": float(s.get("take_profit_pct", 0))
-        })
-
+        px = price_of(s); qty = float(s["quantity"]); val = px * qty if px == px else float("nan")
+        items.append({"kind":"stock","name":s["name"],"code":s.get("ticker",""),"qty":qty,"price":px,"value":val,
+                      "sl_pct":float(s.get("stop_loss_pct",0)),"tp_pct":float(s.get("take_profit_pct",0))})
     for c in pos["crypto"]:
-        px = price_of(c)
-        qty = float(c["quantity"])
-        val = px * qty if px == px else float("nan")
-        items.append({
-            "kind": "crypto",
-            "name": c["name"],
-            "code": c.get("symbol",""),
-            "qty": qty,
-            "price": px,
-            "value": val,
-            "sl_pct": float(c.get("stop_loss_pct", 0)),
-            "tp_pct": float(c.get("take_profit_pct", 0))
-        })
-
+        px = price_of(c); qty = float(c["quantity"]); val = px * qty if px == px else float("nan")
+        items.append({"kind":"crypto","name":c["name"],"code":c.get("symbol",""),"qty":qty,"price":px,"value":val,
+                      "sl_pct":float(c.get("stop_loss_pct",0)),"tp_pct":float(c.get("take_profit_pct",0))})
     total = sum(v["value"] for v in items if v["value"] == v["value"])
     return items, total
 
@@ -306,45 +283,32 @@ def compute_portfolio():
     if old_total and old_total > 0 and total > 0:
         d = abs((total - old_total) / old_total * 100.0)
         jump_ok = d <= MAX_JUMP_PCT
-
     if (total == 0) or (not jump_ok):
-        time.sleep(2.0)
-        items2, total2 = _compute_portfolio_raw()
-        if total2 > 0:
-            items, total = items2, total2
-
+        time.sleep(2.0); items2, total2 = _compute_portfolio_raw()
+        if total2 > 0: items, total = items2, total2
     return items, total
 
 def render_report(items, total):
-    lines = [f"📊 Portfolio-Report — {now_str()}",
-             "---------------------------------------------"]
+    lines = [f"📊 Portfolio-Report — {now_str()}","---------------------------------------------"]
     for it in items:
-        px = it["price"]
-        pxs = "n/a" if not (px == px) else f"{px:,.2f} €"
-        val = it["value"]
-        vals = "n/a" if not (val == val) else f"{val:,.2f} €"
+        px = it["price"]; pxs = "n/a" if not (px == px) else f"{px:,.2f} €"
+        val = it["value"]; vals = "n/a" if not (val == val) else f"{val:,.2f} €"
         lines.append(f"{it['name']} ({it['code']})  {it['qty']:.6f} × {pxs} = {vals}")
-    lines.append("---------------------------------------------")
-    lines.append(f"💰 Gesamtwert: {total:,.2f} €")
+    lines.append("---------------------------------------------"); lines.append(f"💰 Gesamtwert: {total:,.2f} €")
     return "\n".join(lines)
 
 # ----------------------------- Risk/Alerts ----------------------------
 
 def pct_change(new, old):
-    if old is None or old == 0 or not (new == new) or not (old == old):
-        return None
+    if old is None or old == 0 or not (new == new) or not (old == old): return None
     return (new - old) / old * 100.0
 
 def _top_movers(items, old_state, n=3):
     movers = []
     for it in items:
-        code = it["code"] or it["name"]
-        px = it["price"]
-        st = old_state.get(code, {})
-        old_px = st.get("price")
-        chg = pct_change(px, old_px)
-        if chg is not None:
-            movers.append((chg, it["name"], code, px))
+        code = it["code"] or it["name"]; px = it["price"]; st = old_state.get(code, {})
+        old_px = st.get("price"); chg = pct_change(px, old_px)
+        if chg is not None: movers.append((chg, it["name"], code, px))
     gainers = sorted([m for m in movers if m[0] > 0], key=lambda x: x[0], reverse=True)[:n]
     losers  = sorted([m for m in movers if m[0] < 0], key=lambda x: x[0])[:n]
     return gainers, losers
@@ -355,7 +319,6 @@ def evaluate_alerts(items, total):
 
     state = load_json(STATE_FILE, {"portfolio": {"total": None}, "assets": {}})
     alerts = []
-
     old_total = state["portfolio"].get("total")
 
     if (old_total is not None and old_total >= MIN_ALERT_EUR and total >= MIN_ALERT_EUR):
@@ -373,20 +336,13 @@ def evaluate_alerts(items, total):
 
     new_assets = {}
     for it in items:
-        code = it["code"] or it["name"]
-        px = it["price"]
-        st = state["assets"].get(code, {"price": None, "high": None, "low": None})
-
+        code = it["code"] or it["name"]; px = it["price"]; st = state["assets"].get(code, {"price": None, "high": None, "low": None})
         d = pct_change(px, st["price"])
         if d is not None and abs(d) >= cfg_asset:
             alerts.append(f"• {it['name']} ({code}) bewegt sich {d:+.2f}%  (Preis {px:,.2f} €)")
-
         high = px if st["high"] is None else max(st["high"], px)
         low  = px if st["low"]  is None else min(st["low"],  px)
-
-        sl_pct = it.get("sl_pct", 0.0)
-        tp_pct = it.get("tp_pct", 0.0)
-
+        sl_pct = it.get("sl_pct", 0.0); tp_pct = it.get("tp_pct", 0.0)
         if sl_pct > 0 and high == high and px == px:
             sl_level = high * (1 - sl_pct/100.0)
             if px <= sl_level:
@@ -397,34 +353,24 @@ def evaluate_alerts(items, total):
             if px >= tp_level:
                 alerts.append(f"✅ Take-Profit erreicht: {it['name']} ({code}) — Preis {px:,.2f} € ≥ TP {tp_level:,.2f} € (+{tp_pct:.1f}% vom Low {low:,.2f} €)")
                 new_assets[code] = {"price": px, "high": high, "low": low, "need_redeploy": True}
-
         if code not in new_assets:
             new_assets[code] = {"price": px, "high": high, "low": low}
-
     save_json(STATE_FILE, {"portfolio": {"total": total}, "assets": new_assets})
     return alerts
 
 # ----------------------------- Indikatoren ----------------------------
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    if series.empty:
-        return pd.Series(dtype=float)
-    delta = series.diff()
-    up = delta.clip(lower=0.0)
-    down = -delta.clip(upper=0.0)
-    ma_up = up.ewm(com=period-1, adjust=False).mean()
-    ma_down = down.ewm(com=period-1, adjust=False).mean()
-    rs = ma_up / (ma_down.replace(0, np.nan))
-    rsi_v = 100 - (100 / (1 + rs))
-    return rsi_v
+    if series.empty: return pd.Series(dtype=float)
+    delta = series.diff(); up = delta.clip(lower=0.0); down = -delta.clip(upper=0.0)
+    ma_up = up.ewm(com=period-1, adjust=False).mean(); ma_down = down.ewm(com=period-1, adjust=False).mean()
+    rs = ma_up / (ma_down.replace(0, np.nan)); return 100 - (100 / (1 + rs))
 
 def macd(series: pd.Series, fast=12, slow=26, signal=9):
     ema_fast = series.ewm(span=fast, adjust=False).mean()
     ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+    macd_line = ema_fast - ema_slow; signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line, macd_line - signal_line
 
 def sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
@@ -434,27 +380,17 @@ def sma(series: pd.Series, window: int) -> pd.Series:
 def sync_watchlist_from_positions(max_stocks=None, max_crypto=None):
     max_stocks = int(os.getenv("MAX_STOCKS", str(max_stocks if max_stocks else 80)))
     max_crypto = int(os.getenv("MAX_CRYPTO", str(max_crypto if max_crypto else 40)))
-
     pos = load_positions()
     pos_stocks = [_norm_code(s.get("ticker","")) for s in pos.get("stocks", []) if s.get("ticker")]
     pos_crypto = [_norm_code(c.get("symbol","")) for c in pos.get("crypto", []) if c.get("symbol")]
-
-    pool_stocks = pos_stocks + BASE_UNIVERSE_STOCKS
-    pool_crypto = pos_crypto + BASE_UNIVERSE_CRYPTO
-
+    pool_stocks = pos_stocks + BASE_UNIVERSE_STOCKS; pool_crypto = pos_crypto + BASE_UNIVERSE_CRYPTO
     if os.getenv("EXPAND_UNIVERSE", "false").lower() in ("1","true","yes","y"):
-        pool_stocks += EXTRA_UNIVERSE_STOCKS
-        pool_crypto += EXTRA_UNIVERSE_CRYPTO
-
-    stocks_final = _dedup_keep_order(pool_stocks)[:max_stocks]
-    crypto_final = _dedup_keep_order(pool_crypto)[:max_crypto]
-
+        pool_stocks += EXTRA_UNIVERSE_STOCKS; pool_crypto += EXTRA_UNIVERSE_CRYPTO
+    stocks_final = _dedup_keep_order(pool_stocks)[:max_stocks]; crypto_final = _dedup_keep_order(pool_crypto)[:max_crypto]
     wl = load_json(WATCHLIST_FILE, {"stocks": [], "crypto": []})
     wl["stocks"] = _dedup_keep_order(stocks_final + wl.get("stocks", []))[:max_stocks]
     wl["crypto"] = _dedup_keep_order(crypto_final + wl.get("crypto", []))[:max_crypto]
-
-    save_json(WATCHLIST_FILE, wl)
-    return wl
+    save_json(WATCHLIST_FILE, wl); return wl
 
 def load_watchlist():
     return sync_watchlist_from_positions()
@@ -463,86 +399,51 @@ def load_watchlist():
 
 def score_stock(ticker: str) -> dict | None:
     close = stock_history_prefer_alpaca(ticker)
-    if close.empty or len(close) < 50:
-        return None
-    last = float(close.iloc[-1])
-    rsi14 = float(rsi(close, 14).iloc[-1])
-    macd_line, signal_line, hist = macd(close)
-    macd_last, signal_last, hist_last = float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(hist.iloc[-1])
+    if close.empty or len(close) < 50: return None
+    last = float(close.iloc[-1]); rsi14 = float(rsi(close, 14).iloc[-1])
+    macd_line, signal_line, hist = macd(close); macd_last, signal_last, hist_last = float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(hist.iloc[-1])
     sma20, sma50, sma200 = sma(close, 20), sma(close, 50), sma(close, 200)
     sma20_l = float(sma20.iloc[-1]) if not np.isnan(sma20.iloc[-1]) else float("nan")
     sma50_l = float(sma50.iloc[-1]) if not np.isnan(sma50.iloc[-1]) else float("nan")
     sma200_l = float(sma200.iloc[-1]) if not np.isnan(sma200.iloc[-1]) else float("nan")
-
     ret_7d = (last / float(close.iloc[-7]) - 1) * 100 if len(close) >= 8 else 0.0
     ret_30d = (last / float(close.iloc[-30]) - 1) * 100 if len(close) >= 31 else 0.0
-
     score = 0; notes = []
-    if not math.isnan(sma200_l) and (last > sma50_l > sma200_l):
-        score += 2; notes.append("Trend ↑ (Preis>SMA50>SMA200)")
-    elif not math.isnan(sma50_l) and last > sma50_l:
-        score += 1; notes.append("Trend ↑ (Preis>SMA50)")
-    if 35 <= rsi14 <= 60:
-        score += 1; notes.append(f"RSI {rsi14:.0f}")
-    elif rsi14 < 30:
-        score += 1; notes.append(f"RSI {rsi14:.0f} (überverkauft)")
-    if macd_last > signal_last and hist_last > 0:
-        score += 1; notes.append("MACD bullisch")
+    if not math.isnan(sma200_l) and (last > sma50_l > sma200_l): score += 2; notes.append("Trend ↑ (Preis>SMA50>SMA200)")
+    elif not math.isnan(sma50_l) and last > sma50_l: score += 1; notes.append("Trend ↑ (Preis>SMA50)")
+    if 35 <= rsi14 <= 60: score += 1; notes.append(f"RSI {rsi14:.0f}")
+    elif rsi14 < 30: score += 1; notes.append(f"RSI {rsi14:.0f} (überverkauft)")
+    if macd_last > signal_last and hist_last > 0: score += 1; notes.append("MACD bullisch")
     if ret_7d > 2: score += 1; notes.append(f"7d {ret_7d:+.1f}%")
     if ret_30d > 4: score += 1; notes.append(f"30d {ret_30d:+.1f}%")
-
     entry_hint = None
     if not math.isnan(sma20_l):
         dist = (last / sma20_l - 1) * 100
-        if abs(dist) <= 2:
-            entry_hint = f"Nahe SMA20 (Δ {dist:+.1f}%)"
-            score += 1
-
-    return {
-        "code": ticker, "price": last, "score": score, "notes": ", ".join(notes),
-        "rsi": rsi14, "macd": macd_last - signal_last, "ret7": ret_7d, "ret30": ret_30d,
-        "entry_hint": entry_hint
-    }
+        if abs(dist) <= 2: entry_hint = f"Nahe SMA20 (Δ {dist:+.1f}%)"; score += 1
+    return {"code": ticker, "price": last, "score": score, "notes": ", ".join(notes),
+            "rsi": rsi14, "macd": macd_last - signal_last, "ret7": ret_7d, "ret30": ret_30d, "entry_hint": entry_hint}
 
 def score_crypto(coin_id: str) -> dict | None:
     close = coingecko_history(coin_id, days=180)
-    if close.empty or len(close) < 50:
-        return None
-    last = float(close.iloc[-1])
-    rsi14 = float(rsi(close, 14).iloc[-1])
-    macd_line, signal_line, hist = macd(close)
-    macd_last, signal_last, hist_last = float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(hist.iloc[-1])
+    if close.empty or len(close) < 50: return None
+    last = float(close.iloc[-1]); rsi14 = float(rsi(close, 14).iloc[-1])
+    macd_line, signal_line, hist = macd(close); macd_last, signal_last, hist_last = float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(hist.iloc[-1])
     sma20, sma50, sma200 = sma(close, 20), sma(close, 50), sma(close, 200)
     sma20_l, sma50_l, sma200_l = float(sma20.iloc[-1]), float(sma50.iloc[-1]), float(sma200.iloc[-1])
-
     ret_7d = (last / float(close.iloc[-7]) - 1) * 100 if len(close) >= 8 else 0.0
     ret_30d = (last / float(close.iloc[-30]) - 1) * 100 if len(close) >= 31 else 0.0
-
     score = 0; notes = []
-    if last > sma50_l > sma200_l:
-        score += 2; notes.append("Trend ↑ (Preis>SMA50>SMA200)")
-    elif last > sma50_l:
-        score += 1; notes.append("Trend ↑ (Preis>SMA50)")
-    if 35 <= rsi14 <= 60:
-        score += 1; notes.append(f"RSI {rsi14:.0f}")
-    elif rsi14 < 30:
-        score += 1; notes.append(f"RSI {rsi14:.0f} (überverkauft)")
-    if macd_last > signal_last and hist_last > 0:
-        score += 1; notes.append("MACD bullisch")
+    if last > sma50_l > sma200_l: score += 2; notes.append("Trend ↑ (Preis>SMA50>SMA200)")
+    elif last > sma50_l: score += 1; notes.append("Trend ↑ (Preis>SMA50)")
+    if 35 <= rsi14 <= 60: score += 1; notes.append(f"RSI {rsi14:.0f}")
+    elif rsi14 < 30: score += 1; notes.append(f"RSI {rsi14:.0f} (überverkauft)")
+    if macd_last > signal_last and hist_last > 0: score += 1; notes.append("MACD bullisch")
     if ret_7d > 3: score += 1; notes.append(f"7d {ret_7d:+.1f}%")
     if ret_30d > 6: score += 1; notes.append(f"30d {ret_30d:+.1f}%")
-
-    entry_hint = None
-    dist = (last / sma20_l - 1) * 100 if sma20_l else float("nan")
-    if not math.isnan(dist) and abs(dist) <= 2.5:
-        entry_hint = f"Nahe SMA20 (Δ {dist:+.1f}%)"
-        score += 1
-
-    return {
-        "code": coin_id, "price": last, "score": score, "notes": ", ".join(notes),
-        "rsi": rsi14, "macd": macd_last - signal_last, "ret7": ret_7d, "ret30": ret_30d,
-        "entry_hint": entry_hint
-    }
+    entry_hint = None; dist = (last / sma20_l - 1) * 100 if sma20_l else float("nan")
+    if not math.isnan(dist) and abs(dist) <= 2.5: entry_hint = f"Nahe SMA20 (Δ {dist:+.1f}%)"; score += 1
+    return {"code": coin_id, "price": last, "score": score, "notes": ", ".join(notes),
+            "rsi": rsi14, "macd": macd_last - signal_last, "ret7": ret_7d, "ret30": ret_30d, "entry_hint": entry_hint}
 
 def suggest_position_sizes(total_value: float, risk_level: str = "balanced"):
     pct_map = {"conservative": 0.02, "balanced": 0.03, "aggressive": 0.05}
@@ -554,90 +455,62 @@ def suggest_position_sizes(total_value: float, risk_level: str = "balanced"):
     return round(per_trade_eur, 2)
 
 def job_scanner():
-    wl = load_watchlist()
-    items, total = compute_portfolio()
-    if total <= 0:
-        return
-
+    wl = load_watchlist(); items, total = compute_portfolio()
+    if total <= 0: return
     scored_stocks, scored_crypto = [], []
     for t in wl["stocks"]:
-        res = score_stock(t)
+        res = score_stock(t); 
         if res: scored_stocks.append(res)
     for c in wl["crypto"]:
-        res = score_crypto(c)
+        res = score_crypto(c); 
         if res: scored_crypto.append(res)
-
     top_s = sorted(scored_stocks, key=lambda x: x["score"], reverse=True)[:3]
     top_c = sorted(scored_crypto, key=lambda x: x["score"], reverse=True)[:3]
-
     if not top_s and not top_c:
-        notify("Chancenfinder", "Keine klaren Setups aktuell – Kapital in Reserve halten (Schutzmodus).")
-        return
-
-    risk_mode = os.getenv("RISK_MODE", "balanced")
-    size_eur = suggest_position_sizes(total, risk_mode)
-
+        notify("Chancenfinder", "Keine klaren Setups aktuell – Kapital in Reserve halten (Schutzmodus)."); return
+    risk_mode = os.getenv("RISK_MODE", "balanced"); size_eur = suggest_position_sizes(total, risk_mode)
     def fmt(entry):
         hint = f" • {entry['entry_hint']}" if entry.get("entry_hint") else ""
         return (f"{entry['code']}: Score {entry['score']} | Preis ~{entry['price']:,.2f} € | "
                 f"RSI {entry['rsi']:.0f}, MACDΔ {entry['macd']:+.3f}, 7d {entry['ret7']:+.1f}%, 30d {entry['ret30']:+.1f}%"
                 f"{hint} — Vorschlag: ~{size_eur:,.2f} €")
-
     lines = []
-    if top_s:
-        lines.append("📈 Aktien/ETFs – Top Setups:")
-        lines += ["• " + fmt(e) for e in top_s]
-    if top_c:
-        lines.append("\n🪙 Krypto – Top Setups:")
-        lines += ["• " + fmt(e) for e in top_c]
-
+    if top_s: lines.append("📈 Aktien/ETFs – Top Setups:"); lines += ["• " + fmt(e) for e in top_s]
+    if top_c: lines.append("\n🪙 Krypto – Top Setups:");     lines += ["• " + fmt(e) for e in top_c]
     notify("Chancenfinder – neue Reinvest-Ideen", "\n".join(lines))
 
 # ----------------------------- Jobs ----------------------------------
 
 def job_daily_summary():
-    items, total = compute_portfolio()
-    report = render_report(items, total)
-    notify("Tagesbericht", report)
+    items, total = compute_portfolio(); report = render_report(items, total); notify("Tagesbericht", report)
 
 def job_intraday_monitor():
     t = datetime.now(TZ).time()
     if not (t >= datetime.strptime("06:10", "%H:%M").time() and t <= datetime.strptime("22:00", "%H:%M").time()):
-        items, total = compute_portfolio()
-        _ = evaluate_alerts(items, total)
-        return
-
+        items, total = compute_portfolio(); _ = evaluate_alerts(items, total); return
     items, total = compute_portfolio()
     if total < MIN_ALERT_EUR:
         state = load_json(STATE_FILE, {"portfolio": {"total": None}, "assets": {}})
-        save_json(STATE_FILE, {"portfolio": {"total": total}, "assets": state.get("assets", {})})
-        return
-
+        save_json(STATE_FILE, {"portfolio": {"total": total}, "assets": state.get("assets", {})}); return
     alerts = evaluate_alerts(items, total)
-    if alerts:
-        notify("Intraday-Alarm", "\n".join(alerts))
+    if alerts: notify("Intraday-Alarm", "\n".join(alerts))
 
 def main():
     print(f"[{now_str()}] Agent gestartet. Alpaca={'on' if ALPACA_ENABLED else 'off'}")
     sync_watchlist_from_positions()
-
     if not os.path.exists(STATE_FILE):
         items, total = compute_portfolio()
         save_json(STATE_FILE, {"portfolio": {"total": total},
-                               "assets": { (it['code'] or it['name']): {"price": it["price"], "high": it["price"], "low": it["price"]} for it in items }})
+                               "assets": {(it['code'] or it['name']): {"price": it["price"], "high": it["price"], "low": it["price"]} for it in items}})
         print(f"[{now_str()}] Initialer Zustand gespeichert.")
-
     sched = BlockingScheduler(timezone=TZ)
     sched.add_job(job_daily_summary, CronTrigger(hour=6, minute=30))
     sched.add_job(job_intraday_monitor, CronTrigger(day_of_week='mon-fri', hour='6-22', minute='*/15'))
     for hh, mm in [(7,15),(12,15),(16,15),(20,15)]:
         sched.add_job(job_scanner, CronTrigger(day_of_week='mon-sun', hour=hh, minute=mm))
-
     print(f"[{now_str()}] Scheduler aktiv. Warte auf Jobs …")
-    try:
-        sched.start()
-    except (KeyboardInterrupt, SystemExit):
-        print(f"[{now_str()}] Agent gestoppt.")
+    try: sched.start()
+    except (KeyboardInterrupt, SystemExit): print(f"[{now_str()}] Agent gestoppt.")
 
 if __name__ == "__main__":
     main()
