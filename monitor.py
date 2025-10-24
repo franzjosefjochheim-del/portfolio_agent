@@ -1,32 +1,40 @@
-# monitor.py  — Portfolio-Agent (Render)
-# -------------------------------------------------------------------
-# Was macht der Agent?
-# - Tagesbericht morgens (06:30 Europe/Berlin)
-# - Intraday-Überwachung alle 15 Min (Mo–Fr 06:10–22:00)
-#   -> Asset-Alarm (einzelne Titel bewegen sich stark)
-#   -> Portfolio-Alarm (Depot in Summe bewegt sich stark)
-#   -> Trailing-Stop / Take-Profit Warnungen
-#   -> nennt Top-Mover (mit Titel/Position)
-# - Chancenfinder (4x/Tag) scannt Watchlist nach neuen Setups
+# monitor.py — Portfolio-Agent (Render)
 #
-# Benachrichtigung aktuell NUR via Telegram (E-Mail ist deaktiviert).
+# Version: "clean-low-noise"
 #
-# Datenquellen:
-# - Alpaca (Echtzeit US-Ticker wie NVDA, KO, AAPL…)
-# - Yahoo Finance (yfinance) als Fallback, vor allem für London-ETFs
-# - CoinGecko (Krypto) mit Drosselung, damit kein 429-Spam kommt
+# Änderungen ggü. vorher:
+# - Kein Email mehr, nur Telegram + print.
+# - Alpaca bevorzugt für US-Ticker, Yahoo Finance nur für "saubere" US-Symbole.
+# - Alle exotischen Börsen-Endungen (.L .PA .HK .AX etc.) werden NICHT mehr aktiv gepollt;
+#   sie tauchen weiter im Depotwert auf, aber mit value="n/a" statt Spam im Log.
+# - Scanner/Watchlist scannt nur noch US-Titel + Krypto (kein Hongkong, kein Paris usw.).
+# - Top-Mover & Intraday-Alarm nennen jetzt Name UND Ticker.
+# - CoinGecko Requests werden gedrosselt (CG_MIN_INTERVAL_SEC env).
 #
-# Log-Noise reduziert:
-# - Wir fragen Alpaca nur bei US-Tickern (NVDA, KO, IYF etc.).
-#   London/Paris/HK/... werden gar nicht erst an Alpaca geschickt.
-# - yfinance-Fehler/429 werden nur einmal kurz geloggt, nicht gespammt.
+# Jobs:
+#   06:30 Tagesbericht
+#   Intraday alle 15min 06:10–22:00 Mo–Fr (Portfolio-Alarm + Einzelwerte-Alarm)
+#   Chancenfinder 4×/Tag (nur US + Krypto)
 #
-# Universe verschlankt:
-# - Fokus auf London-ETFs & deine echten Kern-US-Titel, kein Asien/Australien mehr
-#   => weniger exotische Ticker => weniger "not found"-Müll in den Logs
+# Benötigte ENV:
+#   TG_BOT_TOKEN, TG_CHAT_ID
+#   APCA_API_KEY_ID, APCA_API_SECRET_KEY, APCA_API_BASE_URL, ALPACA_ENABLED=true
+#   PORT_MOVE_PCT, ASSET_MOVE_PCT
+#   MIN_ALERT_EUR, MAX_JUMP_PCT
+#   RISK_MODE, MAX_STOCKS, MAX_CRYPTO
+#   CG_MIN_INTERVAL_SEC  (z.B. 20)
+#   YF_PAUSE_MS (z.B. 400)
 #
-# Dieses File kannst du 1:1 in Render hochladen/ersetzen.
-# -------------------------------------------------------------------
+# Dateien:
+#   positions.json  <- dein echtes Depot (haben wir befüllt)
+#   last_state.json <- wird automatisch gepflegt
+#   watchlist.json  <- auto-maintained (aber nur US-Ticker)
+#
+# Wichtig:
+# - Wir unterdrücken jetzt explizit Fehlermeldungen für Ticker an Nicht-US-Börsen,
+#   um Render-Logs leise zu halten.
+# - Scanner ignoriert Ticker mit "." im Symbol, weil das meist Non-US ist.
+
 
 import os, json, time, math, re
 from datetime import datetime
@@ -40,88 +48,54 @@ import pandas as pd
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# ----------------------------- Konfiguration / Env -----------------------------
+
+# ----------------------------- Konfiguration -----------------------------
 
 TZ = ZoneInfo("Europe/Berlin")
+STATE_FILE = "last_state.json"
+WATCHLIST_FILE = "watchlist.json"
 
-STATE_FILE = "last_state.json"      # laufender Zustand (für Intraday-Delta)
-WATCHLIST_FILE = "watchlist.json"   # dynamische Watchlist
-POSITIONS_FILE = "positions.json"   # dein Depot (s. unten neue Version)
+# False-Alarm/Alarm-Schwellen
+MIN_ALERT_EUR = float(os.getenv("MIN_ALERT_EUR", "500"))   # Mindestportfoliogröße, damit Alarme Sinn machen
+MAX_JUMP_PCT  = float(os.getenv("MAX_JUMP_PCT", "50"))     # Sprung >50% => wir retryen einmal
+ASSET_MOVE_PCT = float(os.getenv("ASSET_MOVE_PCT", "2"))   # %-Schwelle Einzelwerte
+PORT_MOVE_PCT  = float(os.getenv("PORT_MOVE_PCT", "1"))    # %-Schwelle Gesamtdepot
 
-# False-Alarm-/Robustheits-Parameter
-MIN_ALERT_EUR = float(os.getenv("MIN_ALERT_EUR", "500"))   # Mindest-Portfoliowert für Alerts
-MAX_JUMP_PCT  = float(os.getenv("MAX_JUMP_PCT", "50"))     # wenn Sprung >50%, retry 1x
+# CoinGecko Rate Limit Drossel
+CG_MIN_INTERVAL_SEC = float(os.getenv("CG_MIN_INTERVAL_SEC", "20"))
+_last_cg_call = {}
 
-# Limits für Bewegungs-Alerts
-ASSET_MOVE_PCT = float(os.getenv("ASSET_MOVE_PCT", "2"))   # pro Asset
-PORT_MOVE_PCT  = float(os.getenv("PORT_MOVE_PCT",  "1"))   # Gesamtdepot
-
-# Trading-Universum / Watchlist-Größe
-MAX_STOCKS = int(os.getenv("MAX_STOCKS", "30"))
-MAX_CRYPTO = int(os.getenv("MAX_CRYPTO", "10"))
-
-# Scanner-Risikomodus ("conservative", "balanced", "aggressive")
-RISK_MODE = os.getenv("RISK_MODE", "balanced")
-
-# Throttling / User-Agent für externe APIs
-HTTP_UA = os.getenv(
-    "HTTP_UA",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124 Safari/537.36"
-)
-YF_PAUSE_MS = int(os.getenv("YF_PAUSE_MS", "400"))  # Pause zwischen yfinance Calls (ms)
-CG_MIN_INTERVAL_SEC = float(os.getenv("CG_MIN_INTERVAL_SEC", "20"))  # min Abstand CG Calls
-
-# Telegram
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-TG_CHAT_ID   = os.getenv("TG_CHAT_ID", "")
+# yfinance Schontempo zwischen Requests
+YF_PAUSE_MS = int(os.getenv("YF_PAUSE_MS", "400"))
 
 # Alpaca
-ALPACA_ENABLED    = os.getenv("ALPACA_ENABLED", "false").lower() in ("1", "true", "yes", "on")
-ALPACA_BASE_URL   = os.getenv("APCA_API_BASE_URL", "https://data.alpaca.markets")
-ALPACA_KEY_ID     = os.getenv("APCA_API_KEY_ID", "")
-ALPACA_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY", "")
+ALPACA_ENABLED = os.getenv("ALPACA_ENABLED", "false").lower() in ("1", "true", "yes", "y")
+APCA_API_BASE_URL = os.getenv("APCA_API_BASE_URL", "").rstrip("/")
+APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID", "")
+APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY", "")
 
-# ----------------------------- Watchlist-Universum -----------------------------
-# Gestrafft: London-ETFs + Kern-US-Tech/Quality + breite US-ETFs
-# -> keine Hongkong-, Australien-, Paris-Exoten mehr
+# Märkte, für die wir aktiv versuchen Preise live abzurufen (US-Ticker ohne Punkt)
+US_LIVE_TICKERS_ONLY = True  # alle Symbole mit "." oder anderen exotischen Suffixen werden nur "n/a"
+
+# Universe für Scanner: wir nehmen nur US/Tech/Energie + ETFs ohne Punkt,
+# plus die Kryptos, die du hältst
 BASE_UNIVERSE_STOCKS = [
-    # Breite US-Märkte
-    "SPY", "QQQ",
-    # US Quality / bekannte Large Caps
-    "AAPL", "MSFT", "NVDA", "AMD", "KO", "OXY", "IYF",
-    # Deine London/IE-basierten ETFs
-    "VUSD.L", "VUAA.L", "SWDA.L",
+    "NVDA",  # NVIDIA
+    "KO",    # Coca-Cola
+    "OXY",   # Occidental Petroleum
+    "FVRR",  # Fiverr
+    "IYF"    # US Financials ETF
+    # (Wenn du mehr US-Titel scannen willst, hier ergänzen. Keine Ticker mit "."!)
 ]
 
-# Krypto (CoinGecko IDs)
 BASE_UNIVERSE_CRYPTO = [
-    "bitcoin",
-    "ethereum",
-    "solana",
-    "cardano",
-    "ripple",
-    "chainlink",
+    "bitcoin", "ethereum", "solana", "ripple", "cardano", "chainlink"
 ]
 
-# Optionaler Zusatzkorb (aggressivere Titel, rein wenn EXPAND_UNIVERSE=true)
-EXTRA_UNIVERSE_STOCKS = [
-    "META", "AMZN", "GOOGL", "TSLA", "AVGO"
-]
-EXTRA_UNIVERSE_CRYPTO = [
-    "polkadot", "uniswap", "litecoin"
-]
+# ----------------------------- Helpers ----------------------------------
 
-# ----------------------------- interne Helpers -----------------------------
-
-_last_cg_call = 0.0  # für CoinGecko-Rate-Limit
-
-def now_str() -> str:
+def now_str():
     return datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
-
-def _dbg(msg: str):
-    # kompaktes Logging mit Timestamp (landet in Render Logs)
-    print(f"[{now_str()}] {msg}")
 
 def load_json(path, default):
     try:
@@ -147,242 +121,214 @@ def _dedup_keep_order(seq):
             out.append(k)
     return out
 
-# ----------------------------- Telegram Notify -----------------------------
+
+# ----------------------------- Preisquellen -----------------------------
+
+def _sleep_ms(ms):
+    if ms > 0:
+        time.sleep(ms / 1000.0)
+
+def alpaca_last_price(ticker: str) -> float:
+    """
+    Holt letzten Trade/Quote aus Alpaca für US-Aktien/ETFs.
+    Nur benutzen, wenn ALPACA_ENABLED True und Symbol wirkt US-geeignet.
+    """
+    if not (ALPACA_ENABLED and APCA_API_BASE_URL and APCA_API_KEY_ID and APCA_API_SECRET_KEY):
+        return float("nan")
+
+    # Alpaca kann i.d.R. nur US-Listings, also keine Punkte (".") im Symbol
+    if "." in ticker:
+        return float("nan")
+
+    headers = {
+        "APCA-API-KEY-ID": APCA_API_KEY_ID,
+        "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
+    }
+    try:
+        url = f"{APCA_API_BASE_URL}/v2/stocks/{ticker}/quotes/latest"
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            # Alpaca antwortet mit bid/ask. Wir nehmen Mid.
+            bp = data.get("quote", {}).get("bp")
+            ap = data.get("quote", {}).get("ap")
+            if bp is not None and ap is not None and ap > 0:
+                return float((bp + ap) / 2.0)
+
+        # Fallback letzte Trade
+        url = f"{APCA_API_BASE_URL}/v2/stocks/{ticker}/trades/latest"
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            px = data.get("trade", {}).get("p")
+            if px is not None:
+                return float(px)
+
+        # schweigsamer Fail
+        return float("nan")
+
+    except Exception as e:
+        # Ab hier kein fettes Log mehr jede Minute.
+        # Wir halten Render ruhig -> nur softer print:
+        print(f"[{now_str()}] WARN alpaca {ticker}: {e}")
+        return float("nan")
+
+
+def yf_price_us_only(ticker: str) -> float:
+    """
+    Fragt Yahoo Finance NUR an, wenn das Symbol kein '.' enthält.
+    Grund: London (.L), Paris (.PA), HK (.HK), Australien (.AX) etc.
+    verursachen 429-Spam / keine Daten -> die lassen wir komplett weg.
+    """
+    if "." in ticker:
+        return float("nan")
+    try:
+        t = yf.Ticker(ticker)
+        fi = getattr(t, "fast_info", None)
+        if fi and getattr(fi, "last_price", None):
+            return float(fi.last_price)
+        hist = t.history(period="1d", interval="1d")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception as e:
+        # Yahoo spamt gerne 429 -> wir loggen das nur auf DEBUG-Niveau statt Error
+        print(f"[{now_str()}] DBG yfinance {ticker}: {e}")
+    return float("nan")
+
+
+def yf_history_us_only(ticker: str, period="6mo", interval="1d") -> pd.Series:
+    """gleiches Prinzip wie oben: nur US clean ticker."""
+    if "." in ticker:
+        return pd.Series(dtype=float)
+    try:
+        t = yf.Ticker(ticker)
+        h = t.history(period=period, interval=interval)
+        if not h.empty:
+            return h["Close"].dropna()
+    except Exception as e:
+        print(f"[{now_str()}] DBG yfinance history {ticker}: {e}")
+    return pd.Series(dtype=float)
+
+
+def _cg_throttle(coin_id: str):
+    """
+    CoinGecko-Drossel: mind. CG_MIN_INTERVAL_SEC Sek seit letztem Call pro Coin.
+    """
+    global _last_cg_call
+    now_t = time.time()
+    last = _last_cg_call.get(coin_id, 0)
+    if now_t - last < CG_MIN_INTERVAL_SEC:
+        # Noch nicht wieder erlauben -> return None um zu signalisieren "kein neuer Call"
+        return None
+    _last_cg_call[coin_id] = now_t
+    return True
+
+
+def coingecko_price(coin_id: str) -> float:
+    # Wenn wir in der Sperrzeit sind => kein neuer Request, gib NaN zurück
+    if _cg_throttle(coin_id) is None:
+        return float("nan")
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        r = requests.get(url, params={"ids": coin_id, "vs_currencies": "eur"}, timeout=20)
+        r.raise_for_status()
+        return float(r.json()[coin_id]["eur"])
+    except Exception as e:
+        print(f"[{now_str()}] WARN coingecko {coin_id}: {e}")
+        return float("nan")
+
+
+def coingecko_history(coin_id: str, days=180) -> pd.Series:
+    # Throttle auch hier
+    if _cg_throttle(coin_id) is None:
+        return pd.Series(dtype=float)
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+        r = requests.get(url, params={"vs_currency": "eur", "days": days}, timeout=30)
+        r.raise_for_status()
+        prices = r.json().get("prices", [])
+        if not prices:
+            return pd.Series(dtype=float)
+        ts = [pd.to_datetime(p[0], unit="ms") for p in prices]
+        vals = [float(p[1]) for p in prices]
+        s = pd.Series(vals, index=pd.DatetimeIndex(ts, tz="UTC")).tz_convert(TZ)
+        s = s.resample("1D").last().dropna()
+        return s
+    except Exception as e:
+        print(f"[{now_str()}] WARN cg history {coin_id}: {e}")
+        return pd.Series(dtype=float)
+
+
+# Wrapper für Preis
+def get_stock_price(ticker: str) -> float:
+    """
+    1. Alpaca für US-Ticker
+    2. Yahoo Finance (nur für US-Ticker ohne '.')
+    3. sonst NaN (leise)
+    """
+    px = alpaca_last_price(ticker)
+    if px == px and px > 0:
+        return px
+    _sleep_ms(YF_PAUSE_MS)
+    px = yf_price_us_only(ticker)
+    if px == px and px > 0:
+        return px
+    return float("nan")
+
+
+def get_crypto_price(symbol: str) -> float:
+    return coingecko_price(symbol)
+
+
+# ----------------------------- Benachrichtigungen ----------------------
 
 def send_telegram(msg: str):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+    token = os.getenv("TG_BOT_TOKEN")
+    chat_id = os.getenv("TG_CHAT_ID")
+    if not token or not chat_id:
         return
     try:
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {
-            "chat_id": TG_CHAT_ID,
+            "chat_id": chat_id,
             "text": msg,
             "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
         requests.post(url, data=payload, timeout=15)
     except Exception as e:
-        _dbg(f"WARN telegram: {e}")
+        print(f"[{now_str()}] WARN telegram: {e}")
 
 def notify(title: str, text: str):
     header = f"📣 {title}\n{now_str()}\n\n{text}"
     print(header)
     send_telegram(header)
 
-# ----------------------------- Marktdaten: Alpaca / yfinance / CoinGecko -----
 
-def _looks_like_us_equity(ticker: str) -> bool:
-    """
-    Heuristik, ob wir Alpaca überhaupt fragen:
-    - kein Punkt (also nicht 'VUSD.L')
-    - erstes Zeichen keine Zahl (also nicht '0175.HK')
-    - Länge max. 5
-    - nur A-Z
-    Beispiele True: AAPL, NVDA, KO, IYF
-    Beispiele False: VUSD.L, SWDA.L, VUAA.L, CHIP.PA, 0175.HK
-    """
-    if not ticker:
-        return False
-    if "." in ticker:
-        return False
-    if ticker[0].isdigit():
-        return False
-    if len(ticker) > 5:
-        return False
-    return ticker.isalpha() and ticker.upper() == ticker
-
-def alpaca_price(ticker: str) -> float | None:
-    """
-    Frage Alpaca nach US-Quote.
-    Gibt None zurück, wenn:
-    - Alpaca disabled
-    - Ticker kein 'US-ähnlicher' Ticker (siehe _looks_like_us_equity)
-    - Alpaca kennt den Ticker nicht
-    """
-    if not ALPACA_ENABLED:
-        return None
-    if not (ALPACA_KEY_ID and ALPACA_SECRET_KEY):
-        return None
-    if not _looks_like_us_equity(ticker):
-        return None
-
-    try:
-        url = f"{ALPACA_BASE_URL}/v2/stocks/{ticker}/quotes/latest"
-        headers = {
-            "APCA-API-KEY-ID": ALPACA_KEY_ID,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-            "User-Agent": HTTP_UA,
-        }
-        r = requests.get(url, headers=headers, timeout=5)
-
-        if r.status_code == 404:
-            # "gibt's bei Alpaca nicht" -> kein Lärm
-            return None
-
-        if r.status_code != 200:
-            _dbg(f"WARN alpaca {ticker}: HTTP {r.status_code} {r.text[:120]}")
-            return None
-
-        data = r.json()
-        quote = data.get("quote", {})
-        ap = quote.get("ap")
-        bp = quote.get("bp")
-        if ap and bp:
-            return float((ap + bp) / 2.0)
-        if ap:
-            return float(ap)
-        if bp:
-            return float(bp)
-        return None
-
-    except Exception as e:
-        _dbg(f"WARN alpaca {ticker}: {e}")
-        return None
-
-def yf_price(ticker: str) -> float:
-    """
-    Preis über yfinance, mit kleinem Sleep, ohne Panik bei 429.
-    Gibt float('nan') wenn nix geht.
-    """
-    try:
-        time.sleep(YF_PAUSE_MS / 1000.0)
-        t = yf.Ticker(ticker)
-        fi = getattr(t, "fast_info", None)
-        if fi and getattr(fi, "last_price", None):
-            return float(fi.last_price)
-
-        hist = t.history(period="1d", interval="1d")
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
-
-    except Exception as e:
-        _dbg(f"WARN yfinance {ticker}: {e}")
-
-    return float("nan")
-
-def yf_history(ticker: str, period="6mo", interval="1d") -> pd.Series:
-    """
-    Historische Daten für Scoring (Technische Analyse).
-    Für ausländische ETFs klappt das erstaunlich oft.
-    """
-    try:
-        time.sleep(YF_PAUSE_MS / 1000.0)
-        t = yf.Ticker(ticker)
-        h = t.history(period=period, interval=interval)
-        if not h.empty:
-            return h["Close"].dropna()
-    except Exception as e:
-        _dbg(f"WARN yfinance history {ticker}: {e}")
-    return pd.Series(dtype=float)
-
-def _respect_cg_rate_limit():
-    global _last_cg_call
-    elapsed = time.time() - _last_cg_call
-    wait_need = CG_MIN_INTERVAL_SEC - elapsed
-    if wait_need > 0:
-        time.sleep(wait_need)
-    _last_cg_call = time.time()
-
-def coingecko_price(coin_id: str) -> float:
-    """
-    Spotpreis (EUR) von CoinGecko mit Drosselung.
-    Gibt nan zurück, wenn CG gerade blockt.
-    """
-    try:
-        _respect_cg_rate_limit()
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        r = requests.get(
-            url,
-            params={"ids": coin_id, "vs_currencies": "eur"},
-            headers={"User-Agent": HTTP_UA},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            _dbg(f"WARN coingecko {coin_id}: HTTP {r.status_code} {r.text[:120]}")
-            return float("nan")
-        return float(r.json()[coin_id]["eur"])
-    except Exception as e:
-        _dbg(f"WARN coingecko {coin_id}: {e}")
-        return float("nan")
-
-def coingecko_history(coin_id: str, days=180) -> pd.Series:
-    """
-    Historie (täglich) von CoinGecko für TA-Indikatoren.
-    """
-    try:
-        _respect_cg_rate_limit()
-        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-        r = requests.get(
-            url,
-            params={"vs_currency": "eur", "days": days},
-            headers={"User-Agent": HTTP_UA},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            _dbg(f"WARN coingecko hist {coin_id}: HTTP {r.status_code} {r.text[:120]}")
-            return pd.Series(dtype=float)
-
-        prices = r.json().get("prices", [])
-        if not prices:
-            return pd.Series(dtype=float)
-
-        ts = [pd.to_datetime(p[0], unit="ms") for p in prices]
-        vals = [float(p[1]) for p in prices]
-        s = pd.Series(vals, index=pd.DatetimeIndex(ts, tz="UTC")).tz_convert(TZ)
-        s = s.resample("1D").last().dropna()
-        return s
-
-    except Exception as e:
-        _dbg(f"WARN coingecko history {coin_id}: {e}")
-        return pd.Series(dtype=float)
-
-# ----------------------------- Portfolio Core -----------------------------
+# ----------------------------- Portfolio-Core -------------------------
 
 def load_positions() -> dict:
-    """
-    Lädt dein Depot.
-    Format siehe neue positions.json unten.
-    """
-    p = load_json(POSITIONS_FILE, {})
+    p = load_json("positions.json", {})
     p.setdefault("stocks", [])
     p.setdefault("crypto", [])
     return p
 
-def price_of_stock(ticker: str) -> float:
-    """
-    Erst Alpaca (falls US/wir haben Glück), sonst yfinance.
-    """
-    p_alp = alpaca_price(ticker)
-    if p_alp is not None:
-        return p_alp
-    return yf_price(ticker)
-
-def price_of(asset: dict) -> float:
-    """
-    asset = { "ticker": "...", "quantity": ..., ... }  oder
-            { "symbol": "bitcoin", "quantity": ... }
-    """
-    if "ticker" in asset:
-        return price_of_stock(asset["ticker"])
-    if "symbol" in asset:
-        return coingecko_price(asset["symbol"])
-    return float("nan")
-
 def _compute_portfolio_raw():
-    """
-    Einmalige Berechnung Portfolio, ohne Fail-Safe.
-    """
     pos = load_positions()
     items = []
 
+    # Aktien/ETFs
     for s in pos["stocks"]:
-        px = price_of(s)
+        ticker = s.get("ticker", "")
         qty = float(s.get("quantity", 0))
+
+        px = get_stock_price(ticker)
         val = px * qty if px == px else float("nan")
+
         items.append({
             "kind": "stock",
-            "name": s.get("name", s.get("ticker", "")),
-            "code": s.get("ticker", ""),
+            "name": s["name"],
+            "code": ticker,
             "qty": qty,
             "price": px,
             "value": val,
@@ -390,14 +336,18 @@ def _compute_portfolio_raw():
             "tp_pct": float(s.get("take_profit_pct", 0))
         })
 
+    # Krypto
     for c in pos["crypto"]:
-        px = price_of(c)
+        sym = c.get("symbol", "")
         qty = float(c.get("quantity", 0))
+
+        px = get_crypto_price(sym)
         val = px * qty if px == px else float("nan")
+
         items.append({
             "kind": "crypto",
-            "name": c.get("name", c.get("symbol", "")),
-            "code": c.get("symbol", ""),
+            "name": c["name"],
+            "code": sym,
             "qty": qty,
             "price": px,
             "value": val,
@@ -410,19 +360,17 @@ def _compute_portfolio_raw():
 
 def compute_portfolio():
     """
-    Fail-Safe:
-    - wenn total==0 ODER Sprung > MAX_JUMP_PCT gegenüber altem Wert:
-      -> 2s warten, nochmal messen, nimm den besseren Versuch.
+    Portfolio mit Failover:
+    - wenn total==0 oder Sprung > MAX_JUMP_PCT: einmal 2s warten & Retry
     """
     items, total = _compute_portfolio_raw()
 
     state = load_json(STATE_FILE, {"portfolio": {"total": None}})
     old_total = state["portfolio"].get("total")
-
     jump_ok = True
     if old_total and old_total > 0 and total > 0:
         d = abs((total - old_total) / old_total * 100.0)
-        jump_ok = (d <= MAX_JUMP_PCT)
+        jump_ok = d <= MAX_JUMP_PCT
 
     if (total == 0) or (not jump_ok):
         time.sleep(2.0)
@@ -433,24 +381,21 @@ def compute_portfolio():
     return items, total
 
 def render_report(items, total):
-    lines = [
-        f"📊 Portfolio-Report — {now_str()}",
-        "---------------------------------------------"
-    ]
+    lines = [f"📊 Portfolio-Report — {now_str()}",
+             "---------------------------------------------"]
     for it in items:
         px = it["price"]
-        val = it["value"]
         pxs = "n/a" if not (px == px) else f"{px:,.2f} €"
+        val = it["value"]
         vals = "n/a" if not (val == val) else f"{val:,.2f} €"
-
         # Titel/Position (Name + Ticker)
         lines.append(f"{it['name']} ({it['code']})  {it['qty']:.6f} × {pxs} = {vals}")
-
     lines.append("---------------------------------------------")
     lines.append(f"💰 Gesamtwert: {total:,.2f} €")
     return "\n".join(lines)
 
-# ----------------------------- Risiko / Alerts -----------------------------
+
+# ----------------------------- Risk/Alerts ----------------------------
 
 def pct_change(new, old):
     if old is None or old == 0 or not (new == new) or not (old == old):
@@ -458,10 +403,7 @@ def pct_change(new, old):
     return (new - old) / old * 100.0
 
 def _top_movers(items, old_state, n=3):
-    """
-    Welche Assets sind seit letzter Messung am meisten gestiegen / gefallen
-    (basierend auf Preis %Change)?
-    """
+    """Top Gewinner/Verlierer seit letzter Messung nach Preisänderung."""
     movers = []
     for it in items:
         code = it["code"] or it["name"]
@@ -471,45 +413,28 @@ def _top_movers(items, old_state, n=3):
         chg = pct_change(px, old_px)
         if chg is not None:
             movers.append((chg, it["name"], code, px))
-
-    gainers = sorted(
-        [m for m in movers if m[0] > 0],
-        key=lambda x: x[0],
-        reverse=True
-    )[:n]
-    losers = sorted(
-        [m for m in movers if m[0] < 0],
-        key=lambda x: x[0]
-    )[:n]
-
+    gainers = sorted([m for m in movers if m[0] > 0],
+                     key=lambda x: x[0], reverse=True)[:n]
+    losers  = sorted([m for m in movers if m[0] < 0],
+                     key=lambda x: x[0])[:n]
     return gainers, losers
 
 def evaluate_alerts(items, total):
-    """
-    Prüft:
-    - Portfolio Gesamtbewegung
-    - Einzelbewegung pro Asset
-    - Trailing Stop / Take Profit
-    und aktualisiert STATE_FILE.
-    """
     state = load_json(STATE_FILE, {"portfolio": {"total": None}, "assets": {}})
     alerts = []
 
     old_total = state["portfolio"].get("total")
 
-    # Portfolio-Alarm (nur wenn Depot groß genug ist)
+    # Portfolio-Alarm nur, wenn Depot groß genug ist
     if (old_total is not None and
         old_total >= MIN_ALERT_EUR and
-        total     >= MIN_ALERT_EUR):
+        total      >= MIN_ALERT_EUR):
 
         d_port = pct_change(total, old_total)
         if d_port is not None and abs(d_port) >= PORT_MOVE_PCT:
             gainers, losers = _top_movers(items, state.get("assets", {}), n=3)
-
-            lines = [
-                f"📈/📉 Portfolio-Bewegung: {d_port:+.2f}%  "
-                f"(neu {total:,.2f} €; alt {old_total:,.2f} €)"
-            ]
+            lines = [f"📈/📉 Portfolio-Bewegung: {d_port:+.2f}%  "
+                     f"(neu {total:,.2f} €; alt {old_total:,.2f} €)"]
             if gainers:
                 gtxt = "; ".join([
                     f"{nm} ({cd}) {chg:+.2f}% @ {px:,.2f}€"
@@ -522,7 +447,6 @@ def evaluate_alerts(items, total):
                     for chg, nm, cd, px in losers
                 ])
                 lines.append(f"Top-Verlierer: {ltxt}")
-
             alerts.append("\n".join(lines))
 
     new_assets = {}
@@ -531,13 +455,13 @@ def evaluate_alerts(items, total):
         px = it["price"]
         st = state["assets"].get(code, {"price": None, "high": None, "low": None})
 
+        # Einzelwert %-Move
         d = pct_change(px, st["price"])
         if d is not None and abs(d) >= ASSET_MOVE_PCT:
-            alerts.append(
-                f"• {it['name']} ({code}) bewegt sich {d:+.2f}% "
-                f"(Preis {px:,.2f} €)"
-            )
+            alerts.append(f"• {it['name']} ({code}) bewegt sich {d:+.2f}%  "
+                          f"(Preis {px:,.2f} €)")
 
+        # Trailing SL / TP
         high = px if st["high"] is None else max(st["high"], px)
         low  = px if st["low"]  is None else min(st["low"],  px)
 
@@ -548,39 +472,40 @@ def evaluate_alerts(items, total):
             sl_level = high * (1 - sl_pct/100.0)
             if px <= sl_level:
                 alerts.append(
-                    "⛔ Trailing-Stop erreicht: "
-                    f"{it['name']} ({code}) — Preis {px:,.2f} € ≤ SL {sl_level:,.2f} € "
+                    f"⛔ Trailing-Stop erreicht: {it['name']} ({code}) — "
+                    f"Preis {px:,.2f} € ≤ SL {sl_level:,.2f} € "
                     f"(−{sl_pct:.1f}% vom High {high:,.2f} €)"
                 )
                 new_assets[code] = {
-                    "price": px, "high": high, "low": low, "need_redeploy": True
+                    "price": px,
+                    "high": high,
+                    "low": low,
+                    "need_redeploy": True
                 }
 
         if tp_pct > 0 and low == low and px == px:
             tp_level = low * (1 + tp_pct/100.0)
             if px >= tp_level:
                 alerts.append(
-                    "✅ Take-Profit erreicht: "
-                    f"{it['name']} ({code}) — Preis {px:,.2f} € ≥ TP {tp_level:,.2f} € "
+                    f"✅ Take-Profit erreicht: {it['name']} ({code}) — "
+                    f"Preis {px:,.2f} € ≥ TP {tp_level:,.2f} € "
                     f"(+{tp_pct:.1f}% vom Low {low:,.2f} €)"
                 )
                 new_assets[code] = {
-                    "price": px, "high": high, "low": low, "need_redeploy": True
+                    "price": px,
+                    "high": high,
+                    "low": low,
+                    "need_redeploy": True
                 }
 
         if code not in new_assets:
             new_assets[code] = {"price": px, "high": high, "low": low}
 
-    save_json(
-        STATE_FILE,
-        {
-            "portfolio": {"total": total},
-            "assets": new_assets
-        }
-    )
+    save_json(STATE_FILE, {"portfolio": {"total": total}, "assets": new_assets})
     return alerts
 
-# ----------------------------- TA-Indikatoren / Scoring -----------------------
+
+# ----------------------------- Indikatoren ----------------------------
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -603,14 +528,60 @@ def macd(series: pd.Series, fast=12, slow=26, signal=9):
 def sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
 
+
+# ----------------------------- Watchlist Auto-Sync --------------------
+
+def sync_watchlist_from_positions(max_stocks=None, max_crypto=None):
+    """
+    watchlist.json wird erzeugt/aktualisiert
+    - nimmt nur US-Ticker ohne '.' (damit Scanner/Yahoo nicht heult)
+    - plus Crypto
+    """
+    max_stocks = int(os.getenv("MAX_STOCKS", str(max_stocks if max_stocks else 30)))
+    max_crypto = int(os.getenv("MAX_CRYPTO", str(max_crypto if max_crypto else 10)))
+
+    pos = load_positions()
+
+    # Nimm Aktien/ETFs aus Positionen, aber nur Ticker ohne '.' (US only)
+    pos_stocks = []
+    for s in pos.get("stocks", []):
+        t = _norm_code(s.get("ticker", ""))
+        if t and "." not in t:
+            pos_stocks.append(t)
+
+    pos_crypto = [_norm_code(c.get("symbol","")) for c in pos.get("crypto", []) if c.get("symbol")]
+
+    pool_stocks = pos_stocks + BASE_UNIVERSE_STOCKS
+    pool_crypto = pos_crypto + BASE_UNIVERSE_CRYPTO
+
+    # kein EXPAND mehr -> wir halten’s klein & ruhig
+
+    # dedup + limit
+    stocks_final = _dedup_keep_order([t for t in pool_stocks if "." not in t])[:max_stocks]
+    crypto_final = _dedup_keep_order(pool_crypto)[:max_crypto]
+
+    wl = load_json(WATCHLIST_FILE, {"stocks": [], "crypto": []})
+    wl["stocks"] = _dedup_keep_order(stocks_final + wl.get("stocks", []))
+    wl["stocks"] = [t for t in wl["stocks"] if "." not in t][:max_stocks]
+    wl["crypto"] = _dedup_keep_order(crypto_final + wl.get("crypto", []))[:max_crypto]
+
+    save_json(WATCHLIST_FILE, wl)
+    return wl
+
+def load_watchlist():
+    return sync_watchlist_from_positions()
+
+
+# ----------------------------- Scoring & Scanner ----------------------
+
 def score_stock(ticker: str) -> dict | None:
-    close = yf_history(ticker, period="6mo", interval="1d")
+    close = yf_history_us_only(ticker, period="6mo", interval="1d")
     if close.empty or len(close) < 50:
         return None
 
     last = float(close.iloc[-1])
-    rsi14 = float(rsi(close, 14).iloc[-1])
 
+    rsi14 = float(rsi(close, 14).iloc[-1])
     macd_line, signal_line, hist = macd(close)
     macd_last = float(macd_line.iloc[-1])
     signal_last = float(signal_line.iloc[-1])
@@ -620,11 +591,11 @@ def score_stock(ticker: str) -> dict | None:
     sma50 = sma(close, 50)
     sma200 = sma(close, 200)
 
-    sma20_l = float(sma20.iloc[-1]) if not np.isnan(sma20.iloc[-1]) else float("nan")
-    sma50_l = float(sma50.iloc[-1]) if not np.isnan(sma50.iloc[-1]) else float("nan")
+    sma20_l  = float(sma20.iloc[-1]) if not np.isnan(sma20.iloc[-1]) else float("nan")
+    sma50_l  = float(sma50.iloc[-1]) if not np.isnan(sma50.iloc[-1]) else float("nan")
     sma200_l = float(sma200.iloc[-1]) if not np.isnan(sma200.iloc[-1]) else float("nan")
 
-    ret_7d = (last / float(close.iloc[-7]) - 1) * 100 if len(close) >= 8 else 0.0
+    ret_7d  = (last / float(close.iloc[-7])  - 1) * 100 if len(close) >= 8  else 0.0
     ret_30d = (last / float(close.iloc[-30]) - 1) * 100 if len(close) >= 31 else 0.0
 
     score = 0
@@ -643,10 +614,8 @@ def score_stock(ticker: str) -> dict | None:
     if macd_last > signal_last and hist_last > 0:
         score += 1; notes.append("MACD bullisch")
 
-    if ret_7d > 2:
-        score += 1; notes.append(f"7d {ret_7d:+.1f}%")
-    if ret_30d > 4:
-        score += 1; notes.append(f"30d {ret_30d:+.1f}%")
+    if ret_7d  > 2: score += 1; notes.append(f"7d {ret_7d:+.1f}%")
+    if ret_30d > 4: score += 1; notes.append(f"30d {ret_30d:+.1f}%")
 
     entry_hint = None
     if not math.isnan(sma20_l):
@@ -673,15 +642,15 @@ def score_crypto(coin_id: str) -> dict | None:
         return None
 
     last = float(close.iloc[-1])
-    rsi14 = float(rsi(close, 14).iloc[-1])
 
+    rsi14 = float(rsi(close, 14).iloc[-1])
     macd_line, signal_line, hist = macd(close)
     macd_last = float(macd_line.iloc[-1])
     signal_last = float(signal_line.iloc[-1])
     hist_last = float(hist.iloc[-1])
 
-    sma20  = sma(close, 20)
-    sma50  = sma(close, 50)
+    sma20 = sma(close, 20)
+    sma50 = sma(close, 50)
     sma200 = sma(close, 200)
 
     sma20_l  = float(sma20.iloc[-1])
@@ -707,10 +676,8 @@ def score_crypto(coin_id: str) -> dict | None:
     if macd_last > signal_last and hist_last > 0:
         score += 1; notes.append("MACD bullisch")
 
-    if ret_7d > 3:
-        score += 1; notes.append(f"7d {ret_7d:+.1f}%")
-    if ret_30d > 6:
-        score += 1; notes.append(f"30d {ret_30d:+.1f}%")
+    if ret_7d  > 3: score += 1; notes.append(f"7d {ret_7d:+.1f}%")
+    if ret_30d > 6: score += 1; notes.append(f"30d {ret_30d:+.1f}%")
 
     entry_hint = None
     dist = (last / sma20_l - 1) * 100 if sma20_l else float("nan")
@@ -731,75 +698,24 @@ def score_crypto(coin_id: str) -> dict | None:
     }
 
 def suggest_position_sizes(total_value: float, risk_level: str = "balanced"):
-    """
-    Vorschlag Positionsgröße für neue Ideen (Scanner),
-    mit Puffer: kleines Depot soll nicht sofort All-in gehen.
-    """
     pct_map = {"conservative": 0.02, "balanced": 0.03, "aggressive": 0.05}
     base_pct = pct_map.get(risk_level, 0.03)
     per_trade_eur = total_value * base_pct
-
     min_depot = 1500.0
     safety_buffer = max(total_value - min_depot, 0)
     per_trade_eur = min(per_trade_eur, safety_buffer * 0.2)
-
     return round(per_trade_eur, 2)
-
-# ----------------------------- Watchlist Mgmt -----------------------------
-
-def sync_watchlist_from_positions():
-    """
-    Erstellt/aktualisiert watchlist.json:
-    - nimmt alle Ticker aus deinem Depot
-    - ergänzt unser BASE_UNIVERSE_... + (optional) EXTRA_...
-    - capped via MAX_STOCKS / MAX_CRYPTO
-    """
-    expand = os.getenv("EXPAND_UNIVERSE", "false").lower() in ("1","true","yes","y")
-
-    pos = load_positions()
-    pos_stocks = [
-        _norm_code(s.get("ticker",""))
-        for s in pos.get("stocks", [])
-        if s.get("ticker")
-    ]
-    pos_crypto = [
-        _norm_code(c.get("symbol",""))
-        for c in pos.get("crypto", [])
-        if c.get("symbol")
-    ]
-
-    pool_stocks = pos_stocks + BASE_UNIVERSE_STOCKS
-    pool_crypto = pos_crypto + BASE_UNIVERSE_CRYPTO
-
-    if expand:
-        pool_stocks += EXTRA_UNIVERSE_STOCKS
-        pool_crypto += EXTRA_UNIVERSE_CRYPTO
-
-    stocks_final = _dedup_keep_order(pool_stocks)[:MAX_STOCKS]
-    crypto_final = _dedup_keep_order(pool_crypto)[:MAX_CRYPTO]
-
-    wl = load_json(WATCHLIST_FILE, {"stocks": [], "crypto": []})
-    wl["stocks"] = _dedup_keep_order(stocks_final + wl.get("stocks", []))[:MAX_STOCKS]
-    wl["crypto"] = _dedup_keep_order(crypto_final + wl.get("crypto", []))[:MAX_CRYPTO]
-
-    save_json(WATCHLIST_FILE, wl)
-    return wl
-
-def load_watchlist():
-    # immer zuerst synchronisieren
-    return sync_watchlist_from_positions()
-
-# ----------------------------- Scanner Job -------------------------------
 
 def job_scanner():
     wl = load_watchlist()
     items, total = compute_portfolio()
     if total <= 0:
-        return  # nix Scannen wenn wir gar keinen Wert haben
+        return
 
     scored_stocks = []
     scored_crypto = []
 
+    # nur US-Ticker (scanner stocks) => wl["stocks"] ist bereits "ohne '.'"
     for t in wl["stocks"]:
         res = score_stock(t)
         if res:
@@ -814,20 +730,18 @@ def job_scanner():
     top_c = sorted(scored_crypto, key=lambda x: x["score"], reverse=True)[:3]
 
     if not top_s and not top_c:
-        notify("Chancenfinder", "Keine klaren Setups aktuell – Kapital lieber parken (Schutzmodus).")
+        notify("Chancenfinder", "Keine klaren Setups aktuell – Kapital in Reserve halten (Schutzmodus).")
         return
 
-    size_eur = suggest_position_sizes(total, RISK_MODE)
+    risk_mode = os.getenv("RISK_MODE", "balanced")
+    size_eur = suggest_position_sizes(total, risk_mode)
 
     def fmt(entry):
         hint = f" • {entry['entry_hint']}" if entry.get("entry_hint") else ""
-        return (
-            f"{entry['code']}: Score {entry['score']} | "
-            f"Preis ~{entry['price']:,.2f} € | "
-            f"RSI {entry['rsi']:.0f}, MACDΔ {entry['macd']:+.3f}, "
-            f"7d {entry['ret7']:+.1f}%, 30d {entry['ret30']:+.1f}%"
-            f"{hint} — Vorschlag: ~{size_eur:,.2f} €"
-        )
+        return (f"{entry['code']}: Score {entry['score']} | Preis ~{entry['price']:,.2f} € | "
+                f"RSI {entry['rsi']:.0f}, MACDΔ {entry['macd']:+.3f}, "
+                f"7d {entry['ret7']:+.1f}%, 30d {entry['ret30']:+.1f}%"
+                f"{hint} — Vorschlag: ~{size_eur:,.2f} €")
 
     lines = []
     if top_s:
@@ -839,7 +753,8 @@ def job_scanner():
 
     notify("Chancenfinder – neue Reinvest-Ideen", "\n".join(lines))
 
-# ----------------------------- Scheduler Jobs ---------------------------
+
+# ----------------------------- Jobs ----------------------------------
 
 def job_daily_summary():
     items, total = compute_portfolio()
@@ -847,48 +762,37 @@ def job_daily_summary():
     notify("Tagesbericht", report)
 
 def job_intraday_monitor():
-    """
-    Läuft alle 15 Minuten werktags.
-    - Außerhalb 06:10–22:00 Uhr DE: kein Push, aber State wird aktualisiert.
-    - Innerhalb der Zeit: echte Alerts schicken.
-    """
     t = datetime.now(TZ).time()
-    in_window = (
-        t >= datetime.strptime("06:10", "%H:%M").time() and
-        t <= datetime.strptime("22:00", "%H:%M").time()
-    )
+    # Off-hours: Zustand updaten, aber keine Pushes
+    if not (t >= datetime.strptime("06:10", "%H:%M").time() and
+            t <= datetime.strptime("22:00", "%H:%M").time()):
+        items, total = compute_portfolio()
+        _ = evaluate_alerts(items, total)
+        return
 
     items, total = compute_portfolio()
 
-    # Wenn Portfolio sehr klein ist, bitte keinen Alarmstress
+    # Schutz: nur Alarme, wenn das Depot > Mindestgröße
     if total < MIN_ALERT_EUR:
-        # trotzdem State updaten, damit spätere Prozentvergleiche Sinn machen
         state = load_json(STATE_FILE, {"portfolio": {"total": None}, "assets": {}})
-        save_json(
-            STATE_FILE,
-            {
-                "portfolio": {"total": total},
-                "assets": state.get("assets", {})
-            }
-        )
+        save_json(STATE_FILE, {
+            "portfolio": {"total": total},
+            "assets": state.get("assets", {})
+        })
         return
 
-    # Alerts berechnen
     alerts = evaluate_alerts(items, total)
-
-    # Nur während Handelsfenster pushen
-    if in_window and alerts:
+    if alerts:
         notify("Intraday-Alarm", "\n".join(alerts))
 
-# ----------------------------- Main ------------------------------------
 
 def main():
-    _dbg(f"Agent gestartet. Alpaca={'on' if ALPACA_ENABLED else 'off'}")
+    print(f"[{now_str()}] Agent gestartet. Alpaca={'on' if ALPACA_ENABLED else 'off'}")
 
     # Watchlist initial sync
     sync_watchlist_from_positions()
 
-    # initialen STATE_FILE anlegen, falls fehlt
+    # STATE_FILE initialisieren falls nicht vorhanden
     if not os.path.exists(STATE_FILE):
         items, total = compute_portfolio()
         save_json(
@@ -899,39 +803,32 @@ def main():
                     (it['code'] or it['name']): {
                         "price": it["price"],
                         "high": it["price"],
-                        "low": it["price"]
+                        "low":  it["price"]
                     }
                     for it in items
                 }
             }
         )
-        _dbg("Initialer Zustand gespeichert.")
+        print(f"[{now_str()}] Initialer Zustand gespeichert.")
 
-    # Scheduler konfigurieren
     sched = BlockingScheduler(timezone=TZ)
 
-    # Tagesbericht 06:30 jeden Tag
+    # Tagesbericht 06:30
     sched.add_job(job_daily_summary, CronTrigger(hour=6, minute=30))
 
-    # Intraday-Überwachung alle 15 Min (Mo–Fr zwischen 06:10 und 22:00 berücksichtigt job selbst)
-    sched.add_job(
-        job_intraday_monitor,
-        CronTrigger(day_of_week='mon-fri', hour='6-22', minute='*/15')
-    )
+    # Intraday Monitoring alle 15 Min (Mo–Fr)
+    sched.add_job(job_intraday_monitor, CronTrigger(day_of_week='mon-fri', hour='6-22', minute='*/15'))
 
-    # Chancenfinder 4×/Tag (auch am Wochenende interessant)
-    for hh, mm in [(7,15), (12,15), (16,15), (20,15)]:
-        sched.add_job(
-            job_scanner,
-            CronTrigger(day_of_week='mon-sun', hour=hh, minute=mm)
-        )
+    # Chancenfinder 4×/Tag
+    for hh, mm in [(7,15),(12,15),(16,15),(20,15)]:
+        sched.add_job(job_scanner, CronTrigger(day_of_week='mon-sun', hour=hh, minute=mm))
 
-    _dbg("Scheduler aktiv. Warte auf Jobs …")
-
+    print(f"[{now_str()}] Scheduler aktiv. Warte auf Jobs …")
     try:
         sched.start()
     except (KeyboardInterrupt, SystemExit):
-        _dbg("Agent gestoppt.")
+        print(f"[{now_str()}] Agent gestoppt.")
+
 
 if __name__ == "__main__":
     main()
